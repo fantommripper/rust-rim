@@ -1,0 +1,32 @@
+[package]
+name = "rust-rim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUI — выбери одно:
+eframe = "0.29"              # egui — проще всего для начала
+# iced = "0.13"              # Альтернатива — Elm-архитектура
+# tauri = "2"                # Если хочешь веб-UI (HTML/CSS/JS)
+
+# Сериализация
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# XML парсинг
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Асинхронность (для SteamCMD, скачивания)
+tokio = { version = "1", features = ["full"] }
+
+# Работа с путями и файлами
+walkdir = "2"
+directories = "5"           # Стандартные пути ОС
+
+# Логирование
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Утилиты
+anyhow = "1"                # Удобная обработка ошибок
+thiserror = "2"             # Кастомные ошибки
