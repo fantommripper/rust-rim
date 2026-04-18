@@ -39,6 +39,7 @@ pkgs.mkShell {
 
   shellHook = ''
     export WINIT_UNIX_BACKEND=x11
+    export TMPDIR=/tmp
 
     export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
       pkgs.libGL

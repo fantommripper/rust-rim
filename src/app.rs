@@ -1,0 +1,1127 @@
+use egui::{Align2, Color32, FontId, Frame, Margin, RichText, Sense, Stroke, StrokeKind, Vec2};
+use serde::{Deserialize, Serialize};
+use crate::mod_data::{ModEntry, ModSource, scan_local_mods, scan_dlc_mods, parse_mods_config, write_mods_config, write_mod_list};
+use crate::sorting::CommunityRules;
+use crate::ui::{toolbar, mod_list::ModList, dialogs};
+use crate::ui::steamcmd_panel::SteamCmdPanel;
+use crate::ui::workshop_browser::WorkshopBrowser;
+use crate::steam::steamcmd;
+
+// ─── Цветовая палитра ────────────────────────────────────────────────────────
+pub mod theme {
+    use egui::Color32;
+
+    pub const BG_DARK:       Color32 = Color32::from_rgb(18, 20, 24);
+    pub const BG_PANEL:      Color32 = Color32::from_rgb(25, 28, 34);
+    pub const BG_HEADER:     Color32 = Color32::from_rgb(30, 33, 41);
+    pub const BG_ROW_EVEN:   Color32 = Color32::from_rgb(28, 31, 38);
+    pub const BG_ROW_ODD:    Color32 = Color32::from_rgb(32, 36, 44);
+    pub const BG_ROW_HOVER:  Color32 = Color32::from_rgb(40, 46, 58);
+    pub const BG_SELECTED:   Color32 = Color32::from_rgb(45, 85, 130);
+
+    pub const BORDER:        Color32 = Color32::from_rgb(45, 50, 62);
+    pub const BORDER_ACCENT: Color32 = Color32::from_rgb(70, 130, 200);
+
+    pub const TEXT_PRIMARY:  Color32 = Color32::from_rgb(210, 215, 225);
+    pub const TEXT_MUTED:    Color32 = Color32::from_rgb(120, 130, 148);
+    pub const TEXT_ACCENT:   Color32 = Color32::from_rgb(100, 170, 255);
+
+    pub const ACTIVE_GREEN:  Color32 = Color32::from_rgb(80, 200, 120);
+    pub const WARNING_AMBER: Color32 = Color32::from_rgb(240, 180, 60);
+    pub const ERROR_RED:     Color32 = Color32::from_rgb(220, 75, 75);
+
+    pub const SOURCE_LOCAL:    Color32 = Color32::from_rgb(140, 160, 185);
+    pub const SOURCE_WORKSHOP: Color32 = Color32::from_rgb(100, 160, 240);
+    pub const SOURCE_DLC:      Color32 = Color32::from_rgb(180, 130, 240);
+    pub const SOURCE_CORE:     Color32 = Color32::from_rgb(240, 190, 80);
+
+    pub const HEADER_LEFT:  Color32 = Color32::from_rgb(60, 100, 170);
+    pub const HEADER_RIGHT: Color32 = Color32::from_rgb(60, 150, 100);
+}
+
+// ─── Настройки приложения ────────────────────────────────────────────────────
+#[derive(PartialEq, Default, Clone, Serialize, Deserialize)]
+pub enum SettingsTab {
+    #[default]
+    Paths,
+    Interface,
+    Behavior,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AppSettings {
+    pub game_path: String,
+    pub config_path: String,
+    pub local_mods_path: String,
+    pub dark_theme: bool,
+    pub show_package_ids: bool,
+    pub sort_on_load: bool,
+    pub use_community_rules: bool,
+    /// Базовая папка для SteamCMD (steamcmd/ и steam/ создаются внутри).
+    /// Пустая строка → используется папка данных приложения.
+    pub steamcmd_path: String,
+    #[serde(skip)]
+    pub active_tab: SettingsTab,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            game_path: String::new(),
+            config_path: String::new(),
+            local_mods_path: String::new(),
+            dark_theme: true,
+            show_package_ids: false,
+            sort_on_load: false,
+            use_community_rules: true,
+            steamcmd_path: String::new(),
+            active_tab: SettingsTab::default(),
+        }
+    }
+}
+
+impl AppSettings {
+    /// Возвращает эффективный путь для SteamCMD:
+    /// пользовательский путь если задан, иначе — папка данных приложения.
+    pub fn effective_steamcmd_path(&self) -> String {
+        if !self.steamcmd_path.is_empty() {
+            return self.steamcmd_path.clone();
+        }
+        directories::ProjectDirs::from("com", "rustrim", "RustRim")
+            .map(|d| d.data_dir().join("steamcmd_data").to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl AppSettings {
+    fn config_file_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("com", "rustrim", "RustRim")
+            .map(|dirs| dirs.config_dir().join("settings.json"))
+    }
+
+    pub fn load() -> Self {
+        let Some(path) = Self::config_file_path() else { return Self::default() };
+        let Ok(data) = std::fs::read_to_string(&path) else { return Self::default() };
+        serde_json::from_str(&data).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::config_file_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+}
+
+// ─── Payload для Drag & Drop ─────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub struct DragPayload {
+    pub orig_idx: usize,
+    pub from_active: bool,
+}
+
+// ─── Запросы перемещения модов ───────────────────────────────────────────────
+pub enum MoveRequest {
+    Activate(usize),
+    Deactivate(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    /// Drag & Drop: переместить мод orig_idx в список to_active перед позицией to_pos
+    DragDrop { orig_idx: usize, to_active: bool, to_pos: usize },
+    OpenFolder(usize),
+}
+
+// ─── Состояние поиска ────────────────────────────────────────────────────────
+#[derive(Default)]
+pub struct SearchState {
+    pub inactive_query: String,
+    pub active_query: String,
+}
+
+// ─── Основное состояние приложения ───────────────────────────────────────────
+pub struct RustRim {
+    pub mods: Vec<ModEntry>,
+    /// Индекс выбранного мода в Vec<ModEntry>; единое выделение для обоих списков
+    pub selected: Option<usize>,
+    pub search: SearchState,
+    pub settings: AppSettings,
+
+    show_open_dialog: bool,
+    show_save_dialog: bool,
+    show_settings_dialog: bool,
+
+    /// Кешированная текстура баннера выбранного мода: (путь, хэндл).
+    preview_texture: Option<(std::path::PathBuf, egui::TextureHandle)>,
+
+    /// Закешированные правила сообщества (загружаются при первой сортировке).
+    community_rules: Option<CommunityRules>,
+
+    /// Дубликаты модов: (package_id, список индексов в self.mods).
+    duplicates: Vec<(String, Vec<usize>)>,
+    show_duplicates_dialog: bool,
+    /// Сколько дубликатов было удалено последний раз (для уведомления).
+    last_removed_count: usize,
+
+    /// Панель загрузки модов через SteamCMD.
+    steamcmd_panel: SteamCmdPanel,
+    show_steamcmd_panel: bool,
+    /// Браузер Steam Workshop.
+    workshop_browser: WorkshopBrowser,
+    show_workshop_browser: bool,
+}
+
+impl Default for RustRim {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RustRim {
+    pub fn new() -> Self {
+        let settings = AppSettings::load();
+        let has_paths = !settings.game_path.is_empty() && !settings.local_mods_path.is_empty();
+        let mut app = Self {
+            mods: Vec::new(),
+            selected: None,
+            search: SearchState::default(),
+            show_open_dialog: !has_paths,
+            show_save_dialog: false,
+            show_settings_dialog: false,
+            preview_texture: None,
+            community_rules: None,
+            duplicates: Vec::new(),
+            show_duplicates_dialog: false,
+            last_removed_count: 0,
+            steamcmd_panel: SteamCmdPanel::new(),
+            show_steamcmd_panel: false,
+            workshop_browser: WorkshopBrowser::new(),
+            show_workshop_browser: false,
+            settings,
+        };
+        if has_paths {
+            app.load_local_mods();
+        }
+        app
+    }
+}
+
+
+impl eframe::App for RustRim {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        apply_theme(&ctx);
+
+        // ── Тулбар ──────────────────────────────────────────────────────────
+        let toolbar_resp = egui::Panel::top("toolbar_panel")
+            .frame(Frame::NONE.fill(theme::BG_HEADER).inner_margin(Margin::symmetric(8, 6)))
+            .show_inside(ui, |ui| toolbar::show_toolbar(ui, &self.mods))
+            .inner;
+
+        if toolbar_resp.open_clicked     { self.show_open_dialog = true; }
+        if toolbar_resp.save_clicked     { self.show_save_dialog = true; }
+        if toolbar_resp.sort_clicked     { self.sort_active_mods(); }
+        if toolbar_resp.settings_clicked { self.show_settings_dialog = true; }
+        if toolbar_resp.activate_all     { self.activate_all(); }
+        if toolbar_resp.deactivate_all   { self.deactivate_all(); }
+        if toolbar_resp.save_list_clicked { self.export_mod_list(); }
+        if toolbar_resp.load_list_clicked { self.import_mod_list(); }
+        if toolbar_resp.steamcmd_clicked  { self.show_steamcmd_panel = true; }
+        if toolbar_resp.workshop_clicked   { self.show_workshop_browser = true; }
+
+        // ── Строка состояния ─────────────────────────────────────────────────
+        egui::Panel::bottom("status_bar")
+            .frame(Frame::NONE.fill(theme::BG_HEADER).inner_margin(Margin::symmetric(10, 4)))
+            .show_inside(ui, |ui| {
+                let active_count = self.mods.iter().filter(|m| m.is_active).count();
+                let total = self.mods.len();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!(
+                        "Активных: {}  •  Всего: {}",
+                        active_count, total
+                    )).color(theme::TEXT_MUTED).size(11.5));
+                    let warnings = self.count_warnings();
+                    if warnings > 0 {
+                        ui.separator();
+                        ui.label(RichText::new(format!("⚠ {}", warnings))
+                            .color(theme::WARNING_AMBER).size(11.5));
+                    }
+                });
+            });
+
+        // ── Подготовка индексов списков (нужны и для клавиатуры, и для UI) ──
+        let inactive_indices: Vec<usize> = self.mods.iter().enumerate()
+            .filter(|(_, m)| !m.is_active
+                && (self.search.inactive_query.is_empty()
+                    || m.name.to_lowercase().contains(&self.search.inactive_query.to_lowercase())
+                    || m.package_id.to_lowercase().contains(&self.search.inactive_query.to_lowercase())))
+            .map(|(i, _)| i)
+            .collect();
+
+        let active_indices: Vec<usize> = self.mods.iter().enumerate()
+            .filter(|(_, m)| m.is_active
+                && (self.search.active_query.is_empty()
+                    || m.name.to_lowercase().contains(&self.search.active_query.to_lowercase())
+                    || m.package_id.to_lowercase().contains(&self.search.active_query.to_lowercase())))
+            .map(|(i, _)| i)
+            .collect();
+
+        // ── Клавиатурная навигация (стрелки / Enter) ─────────────────────────
+        let mut pending_req: Option<MoveRequest> = self.handle_keyboard_nav(&ctx, &inactive_indices, &active_indices);
+
+        // ── Правая панель: информация о моде ─────────────────────────────────
+        let selected_mod_idx = self.selected;
+        egui::Panel::right("details_panel")
+            .min_size(240.0)
+            .default_size(300.0)
+            .max_size(500.0)
+            .resizable(true)
+            .frame(
+                Frame::NONE
+                    .fill(theme::BG_PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER_ACCENT))
+                    .inner_margin(Margin::symmetric(10, 5))
+            )
+            .show_inside(ui, |ui| {
+                Frame::NONE
+                    .fill(theme::BG_HEADER)
+                    .inner_margin(Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("ИНФОРМАЦИЯ О МОДЕ")
+                            .color(theme::TEXT_MUTED).size(11.0).strong());
+                    });
+                // Обновляем кеш текстуры баннера для выбранного мода.
+                let preview_path = selected_mod_idx
+                    .and_then(|i| self.mods.get(i))
+                    .and_then(|m| m.preview_path.clone());
+
+                match &preview_path {
+                    Some(path) => {
+                        let stale = self.preview_texture.as_ref()
+                            .map(|(p, _)| p != path)
+                            .unwrap_or(true);
+                        if stale {
+                            self.preview_texture = None;
+                            if let Ok(bytes) = std::fs::read(path) {
+                                if let Ok(img) = image::load_from_memory(&bytes) {
+                                    let rgba = img.to_rgba8();
+                                    let (w, h) = rgba.dimensions();
+                                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                        [w as usize, h as usize],
+                                        rgba.as_raw(),
+                                    );
+                                    let handle = ui.ctx().load_texture(
+                                        "mod_preview", ci, egui::TextureOptions::LINEAR,
+                                    );
+                                    self.preview_texture = Some((path.clone(), handle));
+                                }
+                            }
+                        }
+                    }
+                    None => { self.preview_texture = None; }
+                }
+
+                let selected_mod = selected_mod_idx.and_then(|i| self.mods.get(i));
+                let preview_tex  = self.preview_texture.as_ref().map(|(_, t)| t);
+                show_mod_details(ui, selected_mod, preview_tex);
+            });
+
+        // ── Центральная область: два списка ──────────────────────────────────
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(theme::BG_DARK))
+            .show_inside(ui, |ui| {
+                ui.columns(2, |cols| {
+                // Левая колонка — неактивные
+                Frame::NONE
+                    .fill(theme::BG_PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .show(&mut cols[0], |ui| {
+                        show_panel_header(ui, "НЕАКТИВНЫЕ МОДЫ", theme::HEADER_LEFT, false,
+                            self.mods.iter().filter(|m| !m.is_active).count());
+                        ui.add_space(2.0);
+                        show_search_bar(ui, &mut self.search.inactive_query, "inactive_search");
+                        ui.add_space(2.0);
+                        if let Some(req) = ModList::new(&mut self.mods, &inactive_indices, &mut self.selected, false).show(ui) {
+                            pending_req = Some(req);
+                        }
+                    });
+
+                // Правая колонка — активные
+                Frame::NONE
+                    .fill(theme::BG_PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .show(&mut cols[1], |ui| {
+                        show_panel_header(ui, "АКТИВНЫЕ МОДЫ", theme::HEADER_RIGHT, true,
+                            self.mods.iter().filter(|m| m.is_active).count());
+                        ui.add_space(2.0);
+                        show_search_bar(ui, &mut self.search.active_query, "active_search");
+                        ui.add_space(2.0);
+                        if let Some(req) = ModList::new(&mut self.mods, &active_indices, &mut self.selected, true).show(ui) {
+                            pending_req = Some(req);
+                        }
+                    });
+            });
+        });
+
+        if let Some(req) = pending_req {
+            self.handle_move_request(req);
+        }
+
+        // ── Drag ghost (отображается поверх всего) ───────────────────────────
+        if let Some(payload) = egui::DragAndDrop::payload::<DragPayload>(&ctx) {
+            if let Some(cursor) = ctx.pointer_latest_pos() {
+                let mod_name = self.mods.get(payload.orig_idx)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("...");
+                egui::Area::new(egui::Id::new("drag_ghost"))
+                    .fixed_pos(cursor + Vec2::new(14.0, -10.0))
+                    .order(egui::Order::Tooltip)
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        Frame::NONE
+                            .fill(theme::BG_SELECTED)
+                            .inner_margin(Margin::symmetric(10, 5))
+                            .stroke(Stroke::new(1.0, theme::BORDER_ACCENT))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(mod_name).color(Color32::WHITE).size(12.0));
+                            });
+                    });
+            }
+        }
+        // Если мышь отпущена вне любого списка — сбрасываем payload
+        if egui::DragAndDrop::has_any_payload(&ctx) && ctx.input(|i| i.pointer.primary_released()) {
+            egui::DragAndDrop::clear_payload(&ctx);
+        }
+
+        // ── Диалоги ──────────────────────────────────────────────────────────
+        if self.show_open_dialog {
+            if dialogs::open_folder_dialog(&ctx, &mut self.show_open_dialog, &mut self.settings) {
+                self.settings.save();
+                self.load_local_mods();
+            }
+        }
+        if self.show_save_dialog {
+            let config_path = self.settings.config_path.clone();
+            if dialogs::save_dialog(&ctx, &mut self.show_save_dialog, &self.mods, &config_path) {
+                self.save_mods_config();
+            }
+        }
+        if self.show_settings_dialog {
+            if dialogs::settings_dialog(&ctx, &mut self.show_settings_dialog, &mut self.settings) {
+                self.settings.save();
+                self.load_local_mods();
+            }
+        }
+
+        // ── Панель SteamCMD ──────────────────────────────────────────────────
+        if self.show_steamcmd_panel {
+            let base = self.settings.effective_steamcmd_path();
+            if self.steamcmd_panel.show(&ctx, &mut self.show_steamcmd_panel, &base) {
+                self.load_local_mods();
+            }
+        }
+
+        // ── Браузер Steam Workshop ────────────────────────────────────────────
+        if self.show_workshop_browser {
+            if let Some(ids) = self.workshop_browser.show(&ctx, &mut self.show_workshop_browser) {
+                self.steamcmd_panel.add_ids(&ids);
+                self.show_steamcmd_panel = true;
+            }
+        }
+
+        // ── Диалог дубликатов ────────────────────────────────────────────────
+        if self.show_duplicates_dialog {
+            let mut open = true;
+            egui::Window::new("Обнаружены дубликаты модов")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new(format!(
+                        "Найдено {} мод(ов) с дублирующимися package ID:",
+                        self.duplicates.len()
+                    )).color(theme::WARNING_AMBER));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                        for (id, indices) in &self.duplicates {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("×{}", indices.len()))
+                                    .color(theme::ERROR_RED).size(11.0).strong());
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(id)
+                                    .color(theme::TEXT_ACCENT).size(11.0));
+                            });
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Удалить дубликаты (оставить первый)").clicked() {
+                            self.remove_duplicates();
+                            self.show_duplicates_dialog = false;
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Закрыть").clicked() {
+                            self.show_duplicates_dialog = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_duplicates_dialog = false;
+            }
+        }
+
+        // ── Уведомление об удалении дубликатов ───────────────────────────────
+        if self.last_removed_count > 0 {
+            egui::Window::new("Готово")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new(format!(
+                        "Удалено {} дублирующихся мод(ов).",
+                        self.last_removed_count
+                    )).color(theme::ACTIVE_GREEN));
+                    ui.add_space(6.0);
+                    if ui.button("OK").clicked() {
+                        self.last_removed_count = 0;
+                    }
+                });
+        }
+    }
+}
+
+impl RustRim {
+    fn load_local_mods(&mut self) {
+        if self.settings.local_mods_path.is_empty() {
+            return;
+        }
+        let mut all_mods = Vec::new();
+
+        // Core + DLC из папки Data/ игры идут первыми
+        if !self.settings.game_path.is_empty() {
+            let game_path = std::path::Path::new(&self.settings.game_path);
+            all_mods.extend(scan_dlc_mods(game_path));
+        }
+
+        // Локальные и Workshop моды
+        let mods_path = std::path::Path::new(&self.settings.local_mods_path);
+        all_mods.extend(scan_local_mods(mods_path));
+
+        // Моды скачанные через SteamCMD (если папка существует)
+        let sc_base = self.settings.effective_steamcmd_path();
+        if !sc_base.is_empty() {
+            let content = steamcmd::steam_content_path(std::path::Path::new(&sc_base));
+            if content.is_dir() {
+                all_mods.extend(scan_local_mods(&content));
+            }
+        }
+
+        self.mods = all_mods;
+        self.selected = None;
+        self.preview_texture = None;
+        self.apply_mods_config();
+        self.check_duplicates();
+    }
+
+    fn check_duplicates(&mut self) {
+        let mut seen: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, m) in self.mods.iter().enumerate() {
+            seen.entry(m.package_id.to_lowercase()).or_default().push(i);
+        }
+        self.duplicates = seen.into_iter()
+            .filter(|(_, idxs)| idxs.len() > 1)
+            .collect();
+        self.duplicates.sort_by(|a, b| a.0.cmp(&b.0));
+        self.show_duplicates_dialog = !self.duplicates.is_empty();
+    }
+
+    fn remove_duplicates(&mut self) {
+        let before = self.mods.len();
+        let mut seen = std::collections::HashSet::new();
+        self.mods.retain(|m| seen.insert(m.package_id.to_lowercase()));
+        self.last_removed_count = before - self.mods.len();
+        self.selected = None;
+        self.duplicates.clear();
+    }
+
+    /// Читает ModsConfig.xml и помечает соответствующие моды активными в правильном порядке.
+    fn apply_mods_config(&mut self) {
+        if self.settings.config_path.is_empty() {
+            // Нет конфига — активируем только Core
+            self.activate_core_only();
+            return;
+        }
+        let xml = std::path::Path::new(&self.settings.config_path).join("ModsConfig.xml");
+        if !xml.exists() {
+            self.activate_core_only();
+            return;
+        }
+        let active_ids = match parse_mods_config(&xml) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("Failed to read ModsConfig.xml: {}", e);
+                self.activate_core_only();
+                return;
+            }
+        };
+
+        self.apply_active_ids(&active_ids);
+    }
+
+    /// Активирует моды по переданному списку package_id (нижний регистр).
+    /// Сортирует self.mods: активные в порядке списка, неактивные после.
+    fn apply_active_ids(&mut self, active_ids: &[String]) {
+        let order_map: std::collections::HashMap<String, usize> = active_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.to_lowercase(), i))
+            .collect();
+
+        for m in &mut self.mods {
+            // Core всегда активен
+            if m.source == ModSource::Core {
+                m.is_active = true;
+            } else {
+                m.is_active = order_map.contains_key(&m.package_id.to_lowercase());
+            }
+        }
+
+        // Сортируем self.mods: активные в порядке конфига, неактивные после.
+        // Core получает позицию из order_map (обычно 0 или 2), или идёт первым если не в списке.
+        self.mods.sort_by(|a, b| {
+            let ka = a.package_id.to_lowercase();
+            let kb = b.package_id.to_lowercase();
+            let pos_a = if a.source == ModSource::Core && !order_map.contains_key(&ka) {
+                Some(usize::MAX - 1) // Core без позиции идёт перед неактивными
+            } else {
+                order_map.get(&ka).copied()
+            };
+            let pos_b = if b.source == ModSource::Core && !order_map.contains_key(&kb) {
+                Some(usize::MAX - 1)
+            } else {
+                order_map.get(&kb).copied()
+            };
+            match (pos_a, pos_b) {
+                (Some(oa), Some(ob)) => oa.cmp(&ob),
+                (Some(_), None)      => std::cmp::Ordering::Less,
+                (None, Some(_))      => std::cmp::Ordering::Greater,
+                (None, None)         => std::cmp::Ordering::Equal,
+            }
+        });
+
+        self.selected = None;
+    }
+
+    /// Активирует только Core, все остальные деактивирует.
+    fn activate_core_only(&mut self) {
+        for m in &mut self.mods {
+            m.is_active = m.source == ModSource::Core;
+        }
+        self.mods.sort_by(|a, b| {
+            match (a.source == ModSource::Core, b.source == ModSource::Core) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _             => std::cmp::Ordering::Equal,
+            }
+        });
+        self.selected = None;
+    }
+
+    /// Записывает текущий порядок активных модов в ModsConfig.xml.
+    fn save_mods_config(&mut self) {
+        if self.settings.config_path.is_empty() {
+            tracing::warn!("config_path is not set, cannot save ModsConfig.xml");
+            return;
+        }
+        let xml = std::path::Path::new(&self.settings.config_path).join("ModsConfig.xml");
+        // Дедупликация: если два мода имеют одинаковый package_id — берём первый.
+        let mut seen = std::collections::HashSet::new();
+        let active_ids: Vec<String> = self.mods.iter()
+            .filter(|m| m.is_active && seen.insert(m.package_id.clone()))
+            .map(|m| m.package_id.clone())
+            .collect();
+        if let Err(e) = write_mods_config(&xml, &active_ids) {
+            tracing::error!("Failed to write ModsConfig.xml: {}", e);
+        } else {
+            tracing::info!("Saved {} active mods to {:?}", active_ids.len(), xml);
+        }
+    }
+
+    /// Экспортирует текущий список активных модов в XML-файл (совместимо с RimSort).
+    fn export_mod_list(&mut self) {
+        let Some(path) = crate::ui::dialogs::pick_save_file("Сохранить список модов") else { return };
+        let mut seen = std::collections::HashSet::new();
+        let active_ids: Vec<String> = self.mods.iter()
+            .filter(|m| m.is_active && seen.insert(m.package_id.clone()))
+            .map(|m| m.package_id.clone())
+            .collect();
+        if let Err(e) = write_mod_list(&path, &active_ids) {
+            tracing::error!("Failed to export mod list: {}", e);
+        } else {
+            tracing::info!("Exported {} mods to {:?}", active_ids.len(), path);
+        }
+    }
+
+    /// Импортирует список активных модов из XML-файла (совместимо с RimSort/ModsConfig.xml/.rml).
+    fn import_mod_list(&mut self) {
+        let Some(path) = crate::ui::dialogs::pick_open_file("Загрузить список модов") else { return };
+        let active_ids = match parse_mods_config(&path) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!("Failed to import mod list from {:?}: {}", path, e);
+                return;
+            }
+        };
+        tracing::info!("Imported mod list with {} entries from {:?}", active_ids.len(), path);
+        self.apply_active_ids(&active_ids);
+    }
+
+    fn sort_active_mods(&mut self) {
+        // Загружаем community rules при первом использовании (если включено)
+        if self.settings.use_community_rules && self.community_rules.is_none() {
+            match crate::sorting::fetch_community_rules() {
+                Ok(rules) => {
+                    tracing::info!("Community rules loaded (ts={})", rules.timestamp);
+                    self.community_rules = Some(rules);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch community rules: {}", e);
+                }
+            }
+        }
+
+        let rules = if self.settings.use_community_rules {
+            self.community_rules.as_ref()
+        } else {
+            None
+        };
+
+        crate::sorting::sort_active_mods(&mut self.mods, rules);
+    }
+
+    fn activate_all(&mut self) {
+        for m in &mut self.mods { m.is_active = true; }
+    }
+
+    fn deactivate_all(&mut self) {
+        for m in &mut self.mods {
+            if m.source != ModSource::Core { m.is_active = false; }
+        }
+    }
+
+    fn count_warnings(&self) -> usize {
+        let active_ids: std::collections::HashSet<&str> = self.mods.iter()
+            .filter(|m| m.is_active).map(|m| m.package_id.as_str()).collect();
+        self.mods.iter()
+            .filter(|m| m.is_active)
+            .filter(|m| m.dependencies.iter().any(|d| !active_ids.contains(d.as_str())))
+            .count()
+    }
+
+    /// Перемещает мод (orig_idx) на позицию to_pos в порядке активных модов.
+    fn move_active_mod_to_position(&mut self, orig_idx: usize, to_pos: usize) {
+        // Индексы в self.mods, где лежат активные моды (по порядку)
+        let positions: Vec<usize> = self.mods.iter().enumerate()
+            .filter(|(_, m)| m.is_active)
+            .map(|(i, _)| i)
+            .collect();
+
+        let from_pos = match positions.iter().position(|&i| i == orig_idx) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let to_pos = to_pos.min(positions.len().saturating_sub(1));
+        if from_pos == to_pos { return; }
+
+        let mut active_mods: Vec<ModEntry> = positions.iter().map(|&i| self.mods[i].clone()).collect();
+        let entry = active_mods.remove(from_pos);
+        active_mods.insert(to_pos, entry);
+
+        // Записываем обратно на те же слоты (positions не меняется)
+        for (pos, entry) in positions.iter().zip(active_mods.into_iter()) {
+            self.mods[*pos] = entry;
+        }
+    }
+
+    /// Обрабатывает стрелки и Enter.
+    /// - ↑ / ↓ — двигает выделение внутри того списка, в котором сейчас выделенный мод
+    /// - Enter — перемещает выделенный мод в другой список (активировать / деактивировать)
+    /// - Ctrl+↑ / Ctrl+↓ — меняет позицию активного мода в порядке загрузки
+    /// Ввод игнорируется, если пользователь сейчас печатает в TextEdit
+    /// (например, в поле поиска), чтобы не перехватывать стрелки в тексте.
+    fn handle_keyboard_nav(
+        &mut self,
+        ctx: &egui::Context,
+        inactive_indices: &[usize],
+        active_indices: &[usize],
+    ) -> Option<MoveRequest> {
+        // Если фокус в текстовом поле — не перехватываем стрелки/Enter.
+        if ctx.memory(|m| m.focused().is_some()) {
+            return None;
+        }
+
+        // Определяем, в каком списке сейчас выделенный мод.
+        let (in_active_list, list): (bool, &[usize]) = match self.selected {
+            Some(sel) => {
+                if let Some(m) = self.mods.get(sel) {
+                    if m.is_active { (true, active_indices) } else { (false, inactive_indices) }
+                } else {
+                    // selected указывает в никуда — сбрасываем и выходим
+                    self.selected = None;
+                    return None;
+                }
+            }
+            None => {
+                // Ничего не выделено: на первое же нажатие стрелки — выделяем первый элемент.
+                let pressed_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                let pressed_up   = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                if pressed_down || pressed_up {
+                    if let Some(&first) = inactive_indices.first().or_else(|| active_indices.first()) {
+                        self.selected = Some(first);
+                    }
+                }
+                return None;
+            }
+        };
+
+        // Позиция выделенного мода в своём списке (после фильтрации по поиску).
+        let sel_orig = self.selected.unwrap();
+        let pos_in_list = list.iter().position(|&i| i == sel_orig);
+
+        let (up, down, enter, ctrl) = ctx.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter),
+            i.modifiers.ctrl || i.modifiers.command,
+        ));
+
+        // Ctrl+↑ / Ctrl+↓ — переупорядочивание в списке активных.
+        if ctrl && in_active_list {
+            if up   { return Some(MoveRequest::MoveUp(sel_orig)); }
+            if down { return Some(MoveRequest::MoveDown(sel_orig)); }
+        }
+
+        // Обычные стрелки — сдвиг выделения внутри списка.
+        if up || down {
+            if list.is_empty() { return None; }
+            let new_pos = match pos_in_list {
+                Some(p) => {
+                    if up   { p.saturating_sub(1) }
+                    else    { (p + 1).min(list.len() - 1) }
+                }
+                None => 0,
+            };
+            self.selected = Some(list[new_pos]);
+            return None;
+        }
+
+        // Enter — переносим мод в противоположный список.
+        if enter {
+            if in_active_list {
+                // Деактивировать нельзя только Core.
+                if self.mods.get(sel_orig).map(|m| m.source != ModSource::Core).unwrap_or(false) {
+                    return Some(MoveRequest::Deactivate(sel_orig));
+                }
+            } else {
+                return Some(MoveRequest::Activate(sel_orig));
+            }
+        }
+
+        None
+    }
+
+    fn handle_move_request(&mut self, req: MoveRequest) {
+        match req {
+            MoveRequest::Activate(orig_idx) => {
+                if orig_idx < self.mods.len() { self.mods[orig_idx].is_active = true; }
+            }
+            MoveRequest::Deactivate(orig_idx) => {
+                if orig_idx < self.mods.len() && self.mods[orig_idx].source != ModSource::Core {
+                    self.mods[orig_idx].is_active = false;
+                }
+            }
+            MoveRequest::MoveUp(orig_idx) => {
+                let positions: Vec<usize> = self.mods.iter().enumerate()
+                    .filter(|(_, m)| m.is_active).map(|(i, _)| i).collect();
+                if let Some(pos) = positions.iter().position(|&i| i == orig_idx) {
+                    if pos > 0 { self.mods.swap(orig_idx, positions[pos - 1]); }
+                }
+            }
+            MoveRequest::MoveDown(orig_idx) => {
+                let positions: Vec<usize> = self.mods.iter().enumerate()
+                    .filter(|(_, m)| m.is_active).map(|(i, _)| i).collect();
+                if let Some(pos) = positions.iter().position(|&i| i == orig_idx) {
+                    if pos + 1 < positions.len() { self.mods.swap(orig_idx, positions[pos + 1]); }
+                }
+            }
+            MoveRequest::OpenFolder(idx) => {
+                if let Some(m) = self.mods.get(idx) {
+                    let path = m.path.clone();
+                    #[cfg(target_os = "linux")]
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("explorer").arg(&path).spawn();
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&path).spawn();
+                }
+            }
+            MoveRequest::DragDrop { orig_idx, to_active, to_pos } => {
+                if orig_idx >= self.mods.len() { return; }
+                let from_active = self.mods[orig_idx].is_active;
+                if from_active != to_active {
+                    if to_active {
+                        self.mods[orig_idx].is_active = true;
+                        self.move_active_mod_to_position(orig_idx, to_pos);
+                    } else if self.mods[orig_idx].source != ModSource::Core {
+                        self.mods[orig_idx].is_active = false;
+                    }
+                } else if to_active {
+                    self.move_active_mod_to_position(orig_idx, to_pos);
+                }
+                // Перестановка внутри неактивного списка не нужна (порядок не важен)
+            }
+        }
+    }
+}
+
+// ─── Вспомогательные функции UI ──────────────────────────────────────────────
+
+fn show_panel_header(ui: &mut egui::Ui, title: &str, accent: Color32, is_active: bool, count: usize) {
+    Frame::NONE
+        .fill(theme::BG_HEADER)
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                ui.painter().rect_filled(rect, 1.0, accent);
+                ui.add_space(6.0);
+                ui.label(RichText::new(title).color(accent).size(11.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let badge_color = if is_active { theme::ACTIVE_GREEN } else { theme::TEXT_MUTED };
+                    ui.label(RichText::new(format!("{}", count)).color(badge_color).size(11.0));
+                    ui.label(RichText::new("●").color(badge_color).size(8.0));
+                });
+            });
+        });
+}
+
+fn show_search_bar(ui: &mut egui::Ui, query: &mut String, id: &str) {
+    Frame::NONE
+        .fill(theme::BG_DARK)
+        .inner_margin(Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔍").size(12.0).color(theme::TEXT_MUTED));
+                let edit = egui::TextEdit::singleline(query)
+                    .hint_text("Поиск...")
+                    .id(egui::Id::new(id))
+                    .frame(Frame::NONE)
+                    .desired_width(f32::INFINITY)
+                    .text_color(theme::TEXT_PRIMARY);
+                ui.add(edit);
+                if !query.is_empty() {
+                    if ui.small_button(RichText::new("✕").color(theme::TEXT_MUTED)).clicked() {
+                        query.clear();
+                    }
+                }
+            });
+        });
+}
+
+fn show_mod_details(
+    ui: &mut egui::Ui,
+    mod_entry: Option<&ModEntry>,
+    preview_tex: Option<&egui::TextureHandle>,
+) {
+    match mod_entry {
+        None => {
+            ui.add_space(ui.available_height() / 3.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Выберите мод\nдля просмотра")
+                    .color(theme::TEXT_MUTED).size(12.0).italics());
+            });
+        }
+        Some(m) => {
+            egui::ScrollArea::vertical()
+                .id_salt("details_scroll")
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    // ── Баннер мода ──────────────────────────────────────
+                    let img_w = ui.available_width();
+                    let img_h = 160.0_f32.min(img_w * 0.5625); // 16:9
+
+                    if let Some(tex) = preview_tex {
+                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        let (img_rect, _) = ui.allocate_exact_size(Vec2::new(img_w, img_h), Sense::hover());
+                        // Фон под изображением
+                        ui.painter().rect_filled(img_rect, 4.0, theme::BG_DARK);
+                        // Вписываем изображение с сохранением пропорций
+                        let tex_size = tex.size_vec2();
+                        let scale = (img_w / tex_size.x).min(img_h / tex_size.y);
+                        let draw_size = tex_size * scale;
+                        let draw_rect = egui::Rect::from_center_size(img_rect.center(), draw_size);
+                        ui.painter().image(tex.id(), draw_rect, uv, Color32::WHITE);
+                        ui.painter().rect_stroke(img_rect, 4.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Outside);
+                    } else {
+                        let (img_rect, _) = ui.allocate_exact_size(Vec2::new(img_w, img_h), Sense::hover());
+                        ui.painter().rect_filled(img_rect, 4.0, theme::BG_DARK);
+                        ui.painter().rect_stroke(img_rect, 4.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Outside);
+                        let icon = if m.preview_path.is_some() { "⏳" } else { "◫" };
+                        ui.painter().text(
+                            img_rect.center(),
+                            Align2::CENTER_CENTER,
+                            icon,
+                            FontId::proportional(28.0),
+                            theme::TEXT_MUTED,
+                        );
+                    }
+
+                    ui.add_space(10.0);
+
+                    // ── Название и версия ────────────────────────────────
+                    let src_col = source_color(&m.source);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(source_label(&m.source))
+                            .color(src_col).size(10.0).strong());
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&m.name)
+                            .color(theme::TEXT_PRIMARY).size(13.0).strong());
+                    });
+                    ui.label(RichText::new(format!("v{}", m.version))
+                        .color(theme::TEXT_MUTED).size(11.0));
+
+                    ui.add_space(6.0);
+
+                    // ── Автор и ID ───────────────────────────────────────
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Автор:").color(theme::TEXT_MUTED).size(11.0));
+                        ui.label(RichText::new(&m.author).color(theme::TEXT_ACCENT).size(11.0));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("ID:").color(theme::TEXT_MUTED).size(11.0));
+                        ui.label(RichText::new(&m.package_id).color(theme::TEXT_MUTED).size(10.5));
+                    });
+                    let versions = m.supported_versions.join(", ");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Версии RW:").color(theme::TEXT_MUTED).size(11.0));
+                        ui.label(RichText::new(versions).color(theme::TEXT_PRIMARY).size(11.0));
+                    });
+
+                    // ── Описание ─────────────────────────────────────────
+                    if !m.description.is_empty() {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("ОПИСАНИЕ")
+                            .color(theme::TEXT_MUTED).size(10.0).strong());
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(
+                            RichText::new(&m.description).color(theme::TEXT_PRIMARY).size(11.5)
+                        ).wrap());
+                    }
+
+                    // ── Зависимости и несовместимости ────────────────────
+                    let has_deps = !m.dependencies.is_empty();
+                    let has_incompat = !m.incompatible_with.is_empty();
+                    if has_deps || has_incompat {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
+                    if has_deps {
+                        ui.label(RichText::new("ЗАВИСИМОСТИ")
+                            .color(theme::TEXT_MUTED).size(10.0).strong());
+                        for dep in &m.dependencies {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("→").color(theme::WARNING_AMBER).size(11.0));
+                                ui.label(RichText::new(dep).color(theme::TEXT_PRIMARY).size(11.0));
+                            });
+                        }
+                        ui.add_space(4.0);
+                    }
+                    if has_incompat {
+                        ui.label(RichText::new("НЕСОВМЕСТИМО")
+                            .color(theme::TEXT_MUTED).size(10.0).strong());
+                        for ic in &m.incompatible_with {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("✕").color(theme::ERROR_RED).size(11.0));
+                                ui.label(RichText::new(ic).color(theme::TEXT_PRIMARY).size(11.0));
+                            });
+                        }
+                    }
+                });
+        }
+    }
+}
+
+pub fn source_color(source: &ModSource) -> Color32 {
+    match source {
+        ModSource::Core        => theme::SOURCE_CORE,
+        ModSource::DLC(_)      => theme::SOURCE_DLC,
+        ModSource::Workshop(_) => theme::SOURCE_WORKSHOP,
+        ModSource::Local       => theme::SOURCE_LOCAL,
+    }
+}
+
+pub fn source_label(source: &ModSource) -> &'static str {
+    match source {
+        ModSource::Core        => "CORE",
+        ModSource::DLC(_)      => "DLC",
+        ModSource::Workshop(_) => "WORKSHOP",
+        ModSource::Local       => "LOCAL",
+    }
+}
+
+pub fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals.window_fill         = theme::BG_PANEL;
+    style.visuals.panel_fill          = theme::BG_DARK;
+    style.visuals.override_text_color = Some(theme::TEXT_PRIMARY);
+    style.visuals.window_stroke       = Stroke::new(1.0, theme::BORDER);
+    style.visuals.selection.bg_fill   = theme::BG_SELECTED;
+    style.visuals.selection.stroke    = Stroke::new(1.0, theme::BORDER_ACCENT);
+    style.visuals.extreme_bg_color    = theme::BG_DARK;
+    style.visuals.faint_bg_color      = theme::BG_ROW_ODD;
+
+    // ── Состояния виджетов ────────────────────────────────────────────────────
+    // expansion = 0 на всех состояниях — кнопки не меняют размер при наведении.
+    style.visuals.widgets.noninteractive.expansion = 0.0;
+    style.visuals.widgets.inactive.expansion       = 0.0;
+    style.visuals.widgets.hovered.expansion        = 0.0;
+    style.visuals.widgets.active.expansion         = 0.0;
+    style.visuals.widgets.open.expansion           = 0.0;
+
+    style.visuals.widgets.noninteractive.bg_fill   = theme::BG_PANEL;
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme::TEXT_MUTED);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+
+    style.visuals.widgets.inactive.bg_fill         = theme::BG_ROW_EVEN;
+    style.visuals.widgets.inactive.bg_stroke       = Stroke::new(1.0, theme::BORDER);
+    style.visuals.widgets.inactive.fg_stroke       = Stroke::new(1.0, theme::TEXT_PRIMARY);
+
+    style.visuals.widgets.hovered.bg_fill          = theme::BG_ROW_HOVER;
+    style.visuals.widgets.hovered.bg_stroke        = Stroke::new(1.0, theme::BORDER_ACCENT);
+    style.visuals.widgets.hovered.fg_stroke        = Stroke::new(1.0, theme::TEXT_PRIMARY);
+
+    style.visuals.widgets.active.bg_fill           = theme::BG_SELECTED;
+    style.visuals.widgets.active.bg_stroke         = Stroke::new(1.0, theme::BORDER_ACCENT);
+    style.visuals.widgets.active.fg_stroke         = Stroke::new(1.0, Color32::WHITE);
+
+    style.visuals.widgets.open.bg_fill             = theme::BG_ROW_HOVER;
+    style.visuals.widgets.open.bg_stroke           = Stroke::new(1.0, theme::BORDER_ACCENT);
+
+    // ── Отступы ───────────────────────────────────────────────────────────────
+    style.spacing.item_spacing   = Vec2::new(6.0, 3.0);
+    style.spacing.window_margin  = Margin::same(10);
+    style.spacing.button_padding = Vec2::new(8.0, 4.0);
+
+    ctx.set_global_style(style);
+}
