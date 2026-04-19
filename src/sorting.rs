@@ -116,7 +116,10 @@ impl From<RawRules> for CommunityRules {
 // ─── Загрузка правил ─────────────────────────────────────────────────────────
 
 pub fn fetch_community_rules() -> anyhow::Result<CommunityRules> {
-    let raw: RawRules = ureq::get(COMMUNITY_RULES_URL)
+    let raw: RawRules = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .get(COMMUNITY_RULES_URL)
         .call()
         .map_err(|e| anyhow::anyhow!("{}", e))?
         .into_json()?;

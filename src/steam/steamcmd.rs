@@ -203,8 +203,15 @@ fn run_download(
 
     // ── Запуск SteamCMD (аргументы вместо скрипта — совместимо с NixOS FHS) ──
     let steam_path_str = steam_path.to_string_lossy().replace('\\', "/");
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg(format!("+force_install_dir {steam_path_str}"));
+    let (mut cmd, wrapped) = if is_system {
+        (std::process::Command::new(&exe), false)
+    } else {
+        steamcmd_command(&exe)
+    };
+    if wrapped {
+        let _ = tx.send(DownloadEvent::Log("(обёрнут в steam-run для FHS-совместимости)".into()));
+    }
+    cmd.arg("+force_install_dir").arg(&steam_path_str);
     cmd.arg("+login").arg("anonymous");
     for &id in ids {
         if validate {
@@ -232,13 +239,17 @@ fn run_download(
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                let _ = tx_err.send(DownloadEvent::Log(line));
+                for part in split_ansi_lines(&line) {
+                    if !part.is_empty() {
+                        let _ = tx_err.send(DownloadEvent::Log(part));
+                    }
+                }
             }
         });
     }
 
     // ── Чтение stdout и разбор прогресса ────────────────────────────────────
-    let stdout = child.stdout.take().unwrap();
+    let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("stdout не настроен"))?;
     let reader = std::io::BufReader::new(stdout);
 
     let mut failed: Vec<u64> = Vec::new();
@@ -248,22 +259,27 @@ fn run_download(
             Ok(l) => l,
             Err(_) => continue,
         };
-        let trimmed = line.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
 
-        let _ = tx.send(DownloadEvent::Log(trimmed.clone()));
+        // SteamCMD иногда объединяет несколько событий в одну строку через ANSI-коды.
+        // Разбиваем по ANSI-границам и \r, проверяем все паттерны независимо.
+        for part in split_ansi_lines(&line) {
+            if part.is_empty() { continue; }
 
-        if let Some(id) = parse_downloading_id(&trimmed) {
-            let _ = tx.send(DownloadEvent::ItemStarted(id));
-        } else if let Some(id) = parse_success_id(&trimmed) {
-            let _ = tx.send(DownloadEvent::ItemDone(id));
-        } else if let Some(id) = parse_error_id(&trimmed) {
-            if !failed.contains(&id) {
-                failed.push(id);
+            let _ = tx.send(DownloadEvent::Log(part.clone()));
+
+            // Не используем else-if: одна часть строки может содержать и Success, и Downloading
+            if let Some(id) = parse_downloading_id(&part) {
+                let _ = tx.send(DownloadEvent::ItemStarted(id));
             }
-            let _ = tx.send(DownloadEvent::ItemFailed(id));
+            if let Some(id) = parse_success_id(&part) {
+                let _ = tx.send(DownloadEvent::ItemDone(id));
+            }
+            if let Some(id) = parse_error_id(&part) {
+                if !failed.contains(&id) {
+                    failed.push(id);
+                }
+                let _ = tx.send(DownloadEvent::ItemFailed(id));
+            }
         }
     }
 
@@ -314,6 +330,37 @@ fn steamcmd_command(exe: &Path) -> (std::process::Command, bool) {
     } else {
         (std::process::Command::new(exe), false)
     }
+}
+
+// ─── Очистка ANSI и разбиение строк ──────────────────────────────────────────
+
+/// Убирает ANSI escape-последовательности вида ESC [ ... <letter>.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() { break; }
+                }
+            }
+            // bare ESC без '[' — просто пропускаем
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Зачищает ANSI, делит по '\r', возвращает непустые обрезанные части.
+fn split_ansi_lines(raw: &str) -> Vec<String> {
+    let clean = strip_ansi_codes(raw);
+    clean.split('\r')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // ─── Вспомогательные парсеры вывода SteamCMD ─────────────────────────────────

@@ -9,7 +9,6 @@ const ROW_HEIGHT: f32 = 22.0;
 pub struct ModList<'a> {
     mods:      &'a mut Vec<ModEntry>,
     indices:   &'a [usize],
-    /// Индекс выбранного мода в Vec<ModEntry> (единый для обоих списков)
     selected:  &'a mut Option<usize>,
     is_active: bool,
 }
@@ -34,7 +33,6 @@ impl<'a> ModList<'a> {
 
         let available_height = ui.available_height();
 
-        // ── Состояние hover и drop между кадрами ─────────────────────────────
         let panel_key      = if self.is_active { "active_list"    } else { "inactive_list"    };
         let hover_key      = egui::Id::new(if self.is_active { "active_hover"  } else { "inactive_hover"  });
         let drop_key       = egui::Id::new(if self.is_active { "active_drop"   } else { "inactive_drop"   });
@@ -87,9 +85,7 @@ impl<'a> ModList<'a> {
                             self.mods[orig_idx].incompatible_with.iter()
                                 .any(|ic| active_ids.contains(ic));
 
-                        // Выбираем цвет фона
                         let row_bg = if is_being_dragged {
-                            // Перетаскиваемая строка — слегка затемнена
                             Color32::from_rgb(22, 24, 30)
                         } else if is_selected {
                             theme::BG_SELECTED
@@ -101,115 +97,119 @@ impl<'a> ModList<'a> {
 
                         let accent = if self.is_active { theme::HEADER_RIGHT } else { theme::HEADER_LEFT };
 
-                        // ── Колонка: Значок источника ─────────────────────
+                        // Колонка: иконка источника
                         row.col(|ui| {
-                            let rect = ui.max_rect();
-                            ui.painter().rect_filled(rect, 0.0, row_bg);
-                            if is_selected && !is_being_dragged {
-                                ui.painter().rect_filled(
-                                    Rect::from_min_size(rect.left_top(), Vec2::new(2.0, ROW_HEIGHT)),
-                                    0.0, accent,
+                            ui.push_id(orig_idx * 4, |ui| {
+                                let rect = ui.max_rect();
+                                ui.painter().rect_filled(rect, 0.0, row_bg);
+                                if is_selected && !is_being_dragged {
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(rect.left_top(), Vec2::new(2.0, ROW_HEIGHT)),
+                                        0.0, accent,
+                                    );
+                                }
+                                if is_drop_target {
+                                    paint_drop_line(ui, rect);
+                                }
+                                let src_color = source_color(&self.mods[orig_idx].source);
+                                let label = match &self.mods[orig_idx].source {
+                                    ModSource::Core        => "◆",
+                                    ModSource::DLC(_)      => "★",
+                                    ModSource::Workshop(_) => "◇",
+                                    ModSource::Local       => "◉",
+                                };
+                                let src_widget = ui.add(
+                                    egui::Label::new(RichText::new(label).color(src_color).size(11.0))
+                                        .selectable(false)
+                                        .sense(Sense::hover())
                                 );
-                            }
-                            // Линия-индикатор места вставки
-                            if is_drop_target {
-                                paint_drop_line(ui, rect);
-                            }
-                            let src_color = source_color(&self.mods[orig_idx].source);
-                            let label = match &self.mods[orig_idx].source {
-                                ModSource::Core        => "◆",
-                                ModSource::DLC(_)      => "★",
-                                ModSource::Workshop(_) => "⬡",
-                                ModSource::Local       => "◉",
-                            };
-                            ui.add(egui::Label::new(RichText::new(label).color(src_color).size(11.0)).selectable(false));
-                            // Стабильный ID по Y-позиции, не зависит от индекса строки между проходами
-                            let y_id = rect.min.y.to_bits();
-                            ui.interact(rect, egui::Id::new((panel_key, "src_icon", y_id)), egui::Sense::hover())
-                                .on_hover_text(source_label(&self.mods[orig_idx].source));
+                                src_widget.on_hover_text(source_label(&self.mods[orig_idx].source));
+                            });
                         });
 
-                        // ── Колонка: Название ─────────────────────────────
+                        // Колонка: название
                         row.col(|ui| {
-                            ui.painter().rect_filled(ui.max_rect(), 0.0, row_bg);
-                            if is_drop_target { paint_drop_line(ui, ui.max_rect()); }
-                            let name_color = if is_selected && !is_being_dragged {
-                                Color32::WHITE
-                            } else if has_incompat {
-                                theme::ERROR_RED
-                            } else if has_missing_deps && self.is_active {
-                                theme::WARNING_AMBER
-                            } else if is_being_dragged {
-                                theme::TEXT_MUTED
-                            } else {
-                                theme::TEXT_PRIMARY
-                            };
-                            ui.add(
-                                egui::Label::new(RichText::new(&self.mods[orig_idx].name)
-                                    .color(name_color).size(12.0))
-                                    .truncate()
-                                    .selectable(false),
-                            );
+                            ui.push_id(orig_idx * 4 + 1, |ui| {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, row_bg);
+                                if is_drop_target { paint_drop_line(ui, ui.max_rect()); }
+                                let name_color = if is_selected && !is_being_dragged {
+                                    Color32::WHITE
+                                } else if has_incompat {
+                                    theme::ERROR_RED
+                                } else if has_missing_deps && self.is_active {
+                                    theme::WARNING_AMBER
+                                } else if is_being_dragged {
+                                    theme::TEXT_MUTED
+                                } else {
+                                    theme::TEXT_PRIMARY
+                                };
+                                ui.add(
+                                    egui::Label::new(RichText::new(&self.mods[orig_idx].name)
+                                        .color(name_color).size(12.0))
+                                        .truncate()
+                                        .selectable(false),
+                                );
+                            });
                         });
 
-                        // ── Колонка: Версия ───────────────────────────────
+                        // Колонка: версия
                         row.col(|ui| {
-                            ui.painter().rect_filled(ui.max_rect(), 0.0, row_bg);
-                            if is_drop_target { paint_drop_line(ui, ui.max_rect()); }
-                            let m = &self.mods[orig_idx];
-                            let ver = if !m.version.is_empty() {
-                                m.version.as_str()
-                            } else {
-                                m.supported_versions.last().map(String::as_str).unwrap_or("")
-                            };
-                            ui.add(egui::Label::new(RichText::new(ver)
-                                .color(theme::TEXT_MUTED).size(11.0)).selectable(false));
+                            ui.push_id(orig_idx * 4 + 2, |ui| {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, row_bg);
+                                if is_drop_target { paint_drop_line(ui, ui.max_rect()); }
+                                let m = &self.mods[orig_idx];
+                                let ver = if !m.version.is_empty() {
+                                    m.version.as_str()
+                                } else {
+                                    m.supported_versions.last().map(String::as_str).unwrap_or("")
+                                };
+                                ui.add(egui::Label::new(RichText::new(ver)
+                                    .color(theme::TEXT_MUTED).size(11.0)).selectable(false));
+                            });
                         });
 
-                        // ── Колонка: Предупреждение ───────────────────────
+                        // Колонка: предупреждения
                         row.col(|ui| {
-                            let rect = ui.max_rect();
-                            ui.painter().rect_filled(rect, 0.0, row_bg);
-                            if is_drop_target { paint_drop_line(ui, rect); }
-                            if has_incompat {
-                                ui.add(egui::Label::new(RichText::new("✕").color(theme::ERROR_RED).size(11.0)).selectable(false));
-                                let y_id = rect.min.y.to_bits();
-                                ui.interact(rect, egui::Id::new((panel_key, "warn", y_id)), egui::Sense::hover())
-                                    .on_hover_text("Конфликт с активным модом");
-                            } else if has_missing_deps && self.is_active {
-                                ui.add(egui::Label::new(RichText::new("⚠").color(theme::WARNING_AMBER).size(11.0)).selectable(false));
-                                let y_id = rect.min.y.to_bits();
-                                ui.interact(rect, egui::Id::new((panel_key, "warn", y_id)), egui::Sense::hover())
-                                    .on_hover_text("Отсутствуют зависимости");
-                            }
+                            ui.push_id(orig_idx * 4 + 3, |ui| {
+                                let rect = ui.max_rect();
+                                ui.painter().rect_filled(rect, 0.0, row_bg);
+                                if is_drop_target { paint_drop_line(ui, rect); }
+                                if has_incompat {
+                                    let warn_widget = ui.add(
+                                        egui::Label::new(RichText::new("✕").color(theme::ERROR_RED).size(11.0))
+                                            .selectable(false)
+                                            .sense(Sense::hover())
+                                    );
+                                    warn_widget.on_hover_text("Конфликт с активным модом");
+                                } else if has_missing_deps && self.is_active {
+                                    let warn_widget = ui.add(
+                                        egui::Label::new(RichText::new("⚠").color(theme::WARNING_AMBER).size(11.0))
+                                            .selectable(false)
+                                            .sense(Sense::hover())
+                                    );
+                                    warn_widget.on_hover_text("Отсутствуют зависимости");
+                                }
+                            });
                         });
 
                         let row_resp = row.response();
 
-                        // ── Drag & Drop: начало перетаскивания ────────────
                         if row_resp.drag_started() {
-                            egui::DragAndDrop::set_payload(&ctx, DragPayload {
-                                orig_idx,
-                                from_active: self.is_active,
-                            });
+                            egui::DragAndDrop::set_payload(&ctx, DragPayload { orig_idx });
                         }
 
-                        // ── Отслеживание цели сброса ──────────────────────
                         if is_dragging && row_resp.hovered() && !is_being_dragged {
                             cur_drop_row = Some(row_pos);
                         }
 
-                        // ── Hover для следующего кадра ────────────────────
                         if !is_dragging && row_resp.hovered() {
                             cur_hovered = Some(row_pos);
                         }
 
-                        // ── Клик — выбор ──────────────────────────────────
                         if row_resp.clicked() {
                             *self.selected = Some(orig_idx);
                         }
 
-                        // ── Двойной клик — переместить мод ───────────────
                         if row_resp.double_clicked() {
                             move_request = Some(if self.is_active {
                                 MoveRequest::Deactivate(orig_idx)
@@ -218,7 +218,6 @@ impl<'a> ModList<'a> {
                             });
                         }
 
-                        // ── Контекстное меню ──────────────────────────────
                         row_resp.context_menu(|ui| {
                             ui.set_min_width(180.0);
                             ui.label(RichText::new(&self.mods[orig_idx].name)
@@ -251,7 +250,6 @@ impl<'a> ModList<'a> {
                     });
                 });
 
-            // ── Drag & Drop: определяем сброс ─────────────────────────────────
             if is_dragging && ctx.input(|i| i.pointer.primary_released()) {
                 if let Some(drop_pos) = cur_drop_row.or(prev_drop_row) {
                     if let Some(payload) = egui::DragAndDrop::payload::<DragPayload>(&ctx) {
@@ -266,7 +264,6 @@ impl<'a> ModList<'a> {
                 }
             }
 
-            // Сохраняем состояние для следующего кадра
             ctx.data_mut(|d| d.insert_temp(hover_key, cur_hovered));
             ctx.data_mut(|d| d.insert_temp(drop_key,  cur_drop_row));
 
@@ -277,7 +274,6 @@ impl<'a> ModList<'a> {
     }
 }
 
-/// Рисует горизонтальную линию-индикатор в верхней части rect (место вставки при DnD).
 fn paint_drop_line(ui: &Ui, rect: Rect) {
     ui.painter().rect_filled(
         Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), 2.0)),

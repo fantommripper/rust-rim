@@ -64,6 +64,7 @@ impl SteamCmdPanel {
     ) -> bool {
         self.poll(ctx, steamcmd_base);
 
+        let was_open = *open;
         let mut rescan = false;
 
         egui::Window::new("⬇  Загрузка модов (SteamCMD)")
@@ -80,6 +81,11 @@ impl SteamCmdPanel {
             .show(ctx, |ui| {
                 rescan = self.content(ui, steamcmd_base);
             });
+
+        if was_open && !*open {
+            self.ids_input.clear();
+            self.state = State::Idle;
+        }
 
         rescan
     }
@@ -355,7 +361,7 @@ impl SteamCmdPanel {
             if *completed > 0 {
                 ui.add_space(4.0);
                 let add_btn = egui::Button::new(
-                    RichText::new("↺  Обновить список модов")
+                    RichText::new("↺  Перенести в Mods и обновить список")
                         .color(theme::TEXT_PRIMARY)
                         .size(11.0),
                 )
@@ -364,10 +370,11 @@ impl SteamCmdPanel {
 
                 if ui
                     .add(add_btn)
-                    .on_hover_text("Пересканировать папки, чтобы скачанные моды появились в списке")
+                    .on_hover_text("Переместить скачанные моды в папку RimWorld/Mods и пересканировать список")
                     .clicked()
                 {
                     rescan = true;
+                    self.ids_input.clear();
                     self.state = State::Idle;
                 }
             }

@@ -11,22 +11,37 @@ fn pick_folder(title: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Возвращает путь к папке modlist в директории данных приложения,
+/// создавая её при необходимости.
+fn modlist_dir() -> Option<std::path::PathBuf> {
+    let dir = directories::ProjectDirs::from("com", "rustrim", "RustRim")
+        .map(|d| d.data_dir().join("modlist"))?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
 /// Открывает нативный диалог выбора файла для чтения.
 pub fn pick_open_file(title: &str) -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
+    let mut dlg = rfd::FileDialog::new()
         .set_title(title)
         .add_filter("Список модов RimWorld", &["xml", "rml", "rws"])
-        .add_filter("Все файлы", &["*"])
-        .pick_file()
+        .add_filter("Все файлы", &["*"]);
+    if let Some(dir) = modlist_dir() {
+        dlg = dlg.set_directory(dir);
+    }
+    dlg.pick_file()
 }
 
 /// Открывает нативный диалог выбора файла для сохранения.
 pub fn pick_save_file(title: &str) -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
+    let mut dlg = rfd::FileDialog::new()
         .set_title(title)
         .add_filter("Список модов (XML)", &["xml"])
-        .set_file_name("ModList.xml")
-        .save_file()
+        .set_file_name("ModList.xml");
+    if let Some(dir) = modlist_dir() {
+        dlg = dlg.set_directory(dir);
+    }
+    dlg.save_file()
 }
 
 /// Диалог запроса путей при первом запуске.
@@ -214,8 +229,6 @@ pub fn settings_dialog(ctx: &Context, open: &mut bool, settings: &mut AppSetting
     let mut applied = false;
 
     Window::new("⚙ Настройки")
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .movable(true)
         .collapsible(false)
         .resizable(true)
         .min_width(480.0)
@@ -270,17 +283,16 @@ pub fn settings_dialog(ctx: &Context, open: &mut bool, settings: &mut AppSetting
                 // ── Интерфейс ────────────────────────────────────────────
                 SettingsTab::Interface => {
                     section_header(ui, "ВНЕШНИЙ ВИД");
-                    ui.add_space(4.0);
-                    checkbox_row(ui, &mut settings.dark_theme,        "Тёмная тема");
-                    checkbox_row(ui, &mut settings.show_package_ids,  "Показывать PackageId в списке");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Настройки интерфейса будут добавлены в следующей версии.")
+                            .color(theme::TEXT_MUTED).size(11.0).italics());
+                    });
                 }
 
                 // ── Поведение ────────────────────────────────────────────
                 SettingsTab::Behavior => {
-                    section_header(ui, "ПОВЕДЕНИЕ");
-                    ui.add_space(4.0);
-                    checkbox_row(ui, &mut settings.sort_on_load, "Автосортировка при загрузке");
-                    ui.add_space(6.0);
                     section_header(ui, "СОРТИРОВКА");
                     ui.add_space(4.0);
                     checkbox_row(ui, &mut settings.use_community_rules,

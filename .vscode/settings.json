@@ -4,6 +4,8 @@
         "eframe",
         "egui",
         "Fira",
+        "modlist",
+        "RUSTRIM",
         "serde",
         "tauri",
         "thiserror",

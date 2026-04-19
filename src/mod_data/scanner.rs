@@ -17,7 +17,7 @@ fn find_preview_image(mod_dir: &Path) -> Option<std::path::PathBuf> {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             let lower = name.to_lowercase();
             if matches!(lower.as_str(),
-                "preview.png" | "preview.jpg" | "preview.jpeg" | "preview.webp"
+                "preview.png" | "preview.jpg" | "preview.jpeg" | "preview.webp" | "preview.gif"
             ) {
                 return Some(path);
             }

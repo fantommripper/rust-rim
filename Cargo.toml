@@ -1,6 +1,6 @@
 [package]
 name = "rust-rim"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -16,22 +16,16 @@ serde_json = "1"
 # XML парсинг
 quick-xml = { version = "0.37", features = ["serialize"] }
 
-# Асинхронность (для SteamCMD, скачивания)
-tokio = { version = "1", features = ["full"] }
-
 # Работа с путями и файлами
-walkdir = "2"
 directories = "5"           # Стандартные пути ОС
 
 # Логирование
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Утилиты
 anyhow = "1"                # Удобная обработка ошибок
 thiserror = "2"             # Кастомные ошибки
-rand = "0.8"
-env_logger = "0.11.10"
 
 # Нативные диалоги выбора файлов/папок
 rfd = "0.15"
@@ -40,7 +34,7 @@ rfd = "0.15"
 ureq = { version = "2", features = ["json"] }
 
 # Декодирование изображений (PNG/JPEG/WebP баннеры модов)
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 # HTML-парсинг (Steam Workshop scraping)
 scraper = "0.22"

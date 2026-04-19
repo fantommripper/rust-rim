@@ -120,7 +120,6 @@ impl AppSettings {
 #[derive(Clone, Debug)]
 pub struct DragPayload {
     pub orig_idx: usize,
-    pub from_active: bool,
 }
 
 // ─── Запросы перемещения модов ───────────────────────────────────────────────
@@ -141,6 +140,34 @@ pub struct SearchState {
     pub active_query: String,
 }
 
+// ─── Асинхронная загрузка превью ─────────────────────────────────────────────
+enum PreviewState {
+    Idle,
+    Loading {
+        path: std::path::PathBuf,
+        receiver: std::sync::mpsc::Receiver<Option<egui::ColorImage>>,
+    },
+    Ready {
+        path: std::path::PathBuf,
+        handle: egui::TextureHandle,
+    },
+    Failed(std::path::PathBuf),
+}
+
+impl PreviewState {
+    fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Idle => None,
+            Self::Loading { path, .. } | Self::Ready { path, .. } => Some(path),
+            Self::Failed(path) => Some(path),
+        }
+    }
+
+    fn texture(&self) -> Option<&egui::TextureHandle> {
+        if let Self::Ready { handle, .. } = self { Some(handle) } else { None }
+    }
+}
+
 // ─── Основное состояние приложения ───────────────────────────────────────────
 pub struct RustRim {
     pub mods: Vec<ModEntry>,
@@ -153,8 +180,7 @@ pub struct RustRim {
     show_save_dialog: bool,
     show_settings_dialog: bool,
 
-    /// Кешированная текстура баннера выбранного мода: (путь, хэндл).
-    preview_texture: Option<(std::path::PathBuf, egui::TextureHandle)>,
+    preview_state: PreviewState,
 
     /// Закешированные правила сообщества (загружаются при первой сортировке).
     community_rules: Option<CommunityRules>,
@@ -162,6 +188,7 @@ pub struct RustRim {
     /// Дубликаты модов: (package_id, список индексов в self.mods).
     duplicates: Vec<(String, Vec<usize>)>,
     show_duplicates_dialog: bool,
+    confirm_remove_duplicates: bool,
     /// Сколько дубликатов было удалено последний раз (для уведомления).
     last_removed_count: usize,
 
@@ -190,10 +217,11 @@ impl RustRim {
             show_open_dialog: !has_paths,
             show_save_dialog: false,
             show_settings_dialog: false,
-            preview_texture: None,
+            preview_state: PreviewState::Idle,
             community_rules: None,
             duplicates: Vec::new(),
             show_duplicates_dialog: false,
+            confirm_remove_duplicates: false,
             last_removed_count: 0,
             steamcmd_panel: SteamCmdPanel::new(),
             show_steamcmd_panel: false,
@@ -206,6 +234,41 @@ impl RustRim {
         }
         app
     }
+
+    fn add_missing_dependencies(&mut self) -> usize {
+        let mut activated = 0;
+        let mut queue: Vec<usize> = self.mods.iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_active)
+            .map(|(i, _)| i)
+            .collect();
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(idx) = queue.pop() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            let deps = self.mods[idx].dependencies.clone();
+            for dep_id in deps {
+                // Ищем мод с таким package_id (регистронезависимо)
+                if let Some(dep_idx) = self.mods.iter().position(|m| m.package_id.eq_ignore_ascii_case(&dep_id)) {
+                    if !self.mods[dep_idx].is_active {
+                        self.mods[dep_idx].is_active = true;
+                        activated += 1;
+                        queue.push(dep_idx);
+                    }
+                } else {
+                    tracing::warn!(
+                        "Missing dependency '{}' for mod '{}'",
+                        dep_id,
+                        self.mods[idx].name
+                    );
+                }
+            }
+        }
+        activated
+    }
+
 }
 
 
@@ -220,7 +283,6 @@ impl eframe::App for RustRim {
             .show_inside(ui, |ui| toolbar::show_toolbar(ui, &self.mods))
             .inner;
 
-        if toolbar_resp.open_clicked     { self.show_open_dialog = true; }
         if toolbar_resp.save_clicked     { self.show_save_dialog = true; }
         if toolbar_resp.sort_clicked     { self.sort_active_mods(); }
         if toolbar_resp.settings_clicked { self.show_settings_dialog = true; }
@@ -293,39 +355,62 @@ impl eframe::App for RustRim {
                         ui.label(RichText::new("ИНФОРМАЦИЯ О МОДЕ")
                             .color(theme::TEXT_MUTED).size(11.0).strong());
                     });
-                // Обновляем кеш текстуры баннера для выбранного мода.
+                // Запускаем фоновую загрузку превью если выделение изменилось.
                 let preview_path = selected_mod_idx
                     .and_then(|i| self.mods.get(i))
                     .and_then(|m| m.preview_path.clone());
 
-                match &preview_path {
-                    Some(path) => {
-                        let stale = self.preview_texture.as_ref()
-                            .map(|(p, _)| p != path)
-                            .unwrap_or(true);
-                        if stale {
-                            self.preview_texture = None;
-                            if let Ok(bytes) = std::fs::read(path) {
-                                if let Ok(img) = image::load_from_memory(&bytes) {
+                let state_path = self.preview_state.path().map(|p| p.to_path_buf());
+                if state_path.as_deref() != preview_path.as_deref() {
+                    if let Some(path) = preview_path.clone() {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let path_clone = path.clone();
+                        std::thread::spawn(move || {
+                            let img = std::fs::read(&path_clone)
+                                .ok()
+                                .and_then(|b| image::load_from_memory(&b).ok())
+                                .map(|img| {
                                     let rgba = img.to_rgba8();
                                     let (w, h) = rgba.dimensions();
-                                    let ci = egui::ColorImage::from_rgba_unmultiplied(
-                                        [w as usize, h as usize],
-                                        rgba.as_raw(),
-                                    );
-                                    let handle = ui.ctx().load_texture(
-                                        "mod_preview", ci, egui::TextureOptions::LINEAR,
-                                    );
-                                    self.preview_texture = Some((path.clone(), handle));
-                                }
-                            }
+                                    egui::ColorImage::from_rgba_unmultiplied(
+                                        [w as usize, h as usize], rgba.as_raw(),
+                                    )
+                                });
+                            let _ = tx.send(img);
+                        });
+                        self.preview_state = PreviewState::Loading { path, receiver: rx };
+                    } else {
+                        self.preview_state = PreviewState::Idle;
+                    }
+                }
+
+                // Проверяем, не загрузил ли фоновый поток изображение.
+                let mut new_state: Option<PreviewState> = None;
+                if let PreviewState::Loading { path, receiver } = &self.preview_state {
+                    match receiver.try_recv() {
+                        Ok(Some(ci)) => {
+                            let handle = ctx.load_texture(
+                                "mod_preview", ci, egui::TextureOptions::LINEAR,
+                            );
+                            new_state = Some(PreviewState::Ready { path: path.clone(), handle });
+                        }
+                        Ok(None) => {
+                            new_state = Some(PreviewState::Failed(path.clone()));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                        }
+                        Err(_) => {
+                            new_state = Some(PreviewState::Failed(path.clone()));
                         }
                     }
-                    None => { self.preview_texture = None; }
+                }
+                if let Some(state) = new_state {
+                    self.preview_state = state;
                 }
 
                 let selected_mod = selected_mod_idx.and_then(|i| self.mods.get(i));
-                let preview_tex  = self.preview_texture.as_ref().map(|(_, t)| t);
+                let preview_tex  = self.preview_state.texture();
                 show_mod_details(ui, selected_mod, preview_tex);
             });
 
@@ -420,13 +505,24 @@ impl eframe::App for RustRim {
         if self.show_steamcmd_panel {
             let base = self.settings.effective_steamcmd_path();
             if self.steamcmd_panel.show(&ctx, &mut self.show_steamcmd_panel, &base) {
+                // Переносим скачанные моды в RimWorld/Mods,
+                // чтобы они лежали как обычные локальные моды.
+                let sc_base = std::path::Path::new(&base);
+                let src_dir = steamcmd::steam_content_path(sc_base);
+                let dst_dir = std::path::Path::new(&self.settings.local_mods_path);
+                if !self.settings.local_mods_path.is_empty() && src_dir.is_dir() {
+                    move_downloaded_mods(&src_dir, dst_dir);
+                }
                 self.load_local_mods();
             }
         }
 
         // ── Браузер Steam Workshop ────────────────────────────────────────────
         if self.show_workshop_browser {
-            if let Some(ids) = self.workshop_browser.show(&ctx, &mut self.show_workshop_browser) {
+            let installed_ids: std::collections::HashSet<u64> = self.mods.iter()
+                .filter_map(|m| if let ModSource::Workshop(id) = m.source { Some(id) } else { None })
+                .collect();
+            if let Some(ids) = self.workshop_browser.show(&ctx, &mut self.show_workshop_browser, &installed_ids) {
                 self.steamcmd_panel.add_ids(&ids);
                 self.show_steamcmd_panel = true;
             }
@@ -462,8 +558,8 @@ impl eframe::App for RustRim {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("Удалить дубликаты (оставить первый)").clicked() {
-                            self.remove_duplicates();
                             self.show_duplicates_dialog = false;
+                            self.confirm_remove_duplicates = true;
                         }
                         ui.add_space(8.0);
                         if ui.button("Закрыть").clicked() {
@@ -491,6 +587,28 @@ impl eframe::App for RustRim {
                     if ui.button("OK").clicked() {
                         self.last_removed_count = 0;
                     }
+                });
+        }
+
+        if self.confirm_remove_duplicates {
+            egui::Window::new("Подтверждение удаления")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new("ВНИМАНИЕ!").color(theme::ERROR_RED).strong());
+                    ui.label("Вы собираетесь безвозвратно удалить папки дублирующихся модов с диска.");
+                    ui.label("Отменить это действие будет невозможно.");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Да, удалить").clicked() {
+                            self.remove_duplicates();
+                            self.confirm_remove_duplicates = false;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.confirm_remove_duplicates = false;
+                        }
+                    });
                 });
         }
     }
@@ -524,7 +642,7 @@ impl RustRim {
 
         self.mods = all_mods;
         self.selected = None;
-        self.preview_texture = None;
+        self.preview_state = PreviewState::Idle;
         self.apply_mods_config();
         self.check_duplicates();
     }
@@ -542,10 +660,58 @@ impl RustRim {
     }
 
     fn remove_duplicates(&mut self) {
-        let before = self.mods.len();
-        let mut seen = std::collections::HashSet::new();
-        self.mods.retain(|m| seen.insert(m.package_id.to_lowercase()));
-        self.last_removed_count = before - self.mods.len();
+        let mut to_remove_indices = std::collections::HashSet::new();
+        for (_, indices) in &self.duplicates {
+            if indices.len() <= 1 { continue; }
+            // Оставляем первый индекс, удаляем остальные
+            for &idx in &indices[1..] {
+                to_remove_indices.insert(idx);
+            }
+        }
+
+        let mut sorted: Vec<usize> = to_remove_indices.into_iter().collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut removed_count = 0;
+        let mut actually_remove: Vec<usize> = Vec::new();
+        for &idx in &sorted {
+            if idx >= self.mods.len() { continue; }
+            let m = &self.mods[idx];
+            // Пропускаем Core и DLC (на всякий случай)
+            if matches!(m.source, ModSource::Core | ModSource::DLC(_)) {
+                tracing::warn!("Skipping deletion of core/dlc mod at {:?}", m.path);
+                continue;
+            }
+            let disk_ok = if m.path.exists() {
+                match std::fs::remove_dir_all(&m.path) {
+                    Ok(_) => {
+                        tracing::info!("Deleted duplicate mod folder: {:?}", m.path);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to delete mod folder {:?}: {}", m.path, e);
+                        false
+                    }
+                }
+            } else {
+                tracing::warn!("Mod folder does not exist: {:?}", m.path);
+                true // папки нет — из списка тоже убираем
+            };
+            if disk_ok {
+                removed_count += 1;
+                actually_remove.push(idx);
+            }
+        }
+
+        // Удаляем из self.mods только те записи, где диск был успешно очищен
+        actually_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in actually_remove {
+            if idx < self.mods.len() {
+                self.mods.remove(idx);
+            }
+        }
+
+        self.last_removed_count = removed_count;
         self.selected = None;
         self.duplicates.clear();
     }
@@ -588,7 +754,13 @@ impl RustRim {
             if m.source == ModSource::Core {
                 m.is_active = true;
             } else {
-                m.is_active = order_map.contains_key(&m.package_id.to_lowercase());
+                let by_pkg = order_map.contains_key(&m.package_id.to_lowercase());
+                // Также проверяем совпадение по Workshop ID (для файлов-списков сборок)
+                let by_wid = match &m.source {
+                    ModSource::Workshop(wid) => order_map.contains_key(&wid.to_string()),
+                    _ => false,
+                };
+                m.is_active = by_pkg || by_wid;
             }
         }
 
@@ -597,15 +769,20 @@ impl RustRim {
         self.mods.sort_by(|a, b| {
             let ka = a.package_id.to_lowercase();
             let kb = b.package_id.to_lowercase();
+            let wid_key = |src: &ModSource| -> Option<String> {
+                if let ModSource::Workshop(wid) = src { Some(wid.to_string()) } else { None }
+            };
             let pos_a = if a.source == ModSource::Core && !order_map.contains_key(&ka) {
-                Some(usize::MAX - 1) // Core без позиции идёт перед неактивными
+                Some(0) // Core без позиции в конфиге идёт первым среди активных
             } else {
                 order_map.get(&ka).copied()
+                    .or_else(|| wid_key(&a.source).as_deref().and_then(|k| order_map.get(k).copied()))
             };
             let pos_b = if b.source == ModSource::Core && !order_map.contains_key(&kb) {
-                Some(usize::MAX - 1)
+                Some(0)
             } else {
                 order_map.get(&kb).copied()
+                    .or_else(|| wid_key(&b.source).as_deref().and_then(|k| order_map.get(k).copied()))
             };
             match (pos_a, pos_b) {
                 (Some(oa), Some(ob)) => oa.cmp(&ob),
@@ -682,7 +859,14 @@ impl RustRim {
         self.apply_active_ids(&active_ids);
     }
 
-    fn sort_active_mods(&mut self) {
+    pub fn sort_active_mods(&mut self) {
+        // Добавляем недостающие зависимости
+        let added = self.add_missing_dependencies();
+        if added > 0 {
+            tracing::info!("Automatically activated {} missing dependencies", added);
+            // Можно показать всплывающее уведомление (опционально)
+        }
+
         // Загружаем community rules при первом использовании (если включено)
         if self.settings.use_community_rules && self.community_rules.is_none() {
             match crate::sorting::fetch_community_rules() {
@@ -893,6 +1077,8 @@ impl RustRim {
 
 // ─── Вспомогательные функции UI ──────────────────────────────────────────────
 
+
+
 fn show_panel_header(ui: &mut egui::Ui, title: &str, accent: Color32, is_active: bool, count: usize) {
     Frame::NONE
         .fill(theme::BG_HEADER)
@@ -995,8 +1181,10 @@ fn show_mod_details(
                         ui.label(RichText::new(&m.name)
                             .color(theme::TEXT_PRIMARY).size(13.0).strong());
                     });
-                    ui.label(RichText::new(format!("v{}", m.version))
-                        .color(theme::TEXT_MUTED).size(11.0));
+                    if !m.version.is_empty() {
+                        ui.label(RichText::new(format!("v{}", m.version))
+                            .color(theme::TEXT_MUTED).size(11.0));
+                    }
 
                     ui.add_space(6.0);
 
@@ -1052,7 +1240,7 @@ fn show_mod_details(
                             .color(theme::TEXT_MUTED).size(10.0).strong());
                         for ic in &m.incompatible_with {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("✕").color(theme::ERROR_RED).size(11.0));
+                                ui.label(RichText::new("×").color(theme::ERROR_RED).size(11.0));
                                 ui.label(RichText::new(ic).color(theme::TEXT_PRIMARY).size(11.0));
                             });
                         }
@@ -1078,6 +1266,95 @@ pub fn source_label(source: &ModSource) -> &'static str {
         ModSource::Workshop(_) => "WORKSHOP",
         ModSource::Local       => "LOCAL",
     }
+}
+
+/// Переносит все папки модов из `src_dir` (папка SteamCMD content/294100/)
+/// в `dst_dir` (RimWorld/Mods). Если папка с таким именем уже существует
+/// в назначении — она будет заменена (старая удаляется).
+///
+/// Используется fs::rename, а при ошибке (например, перенос между разными
+/// файловыми системами) — fallback через рекурсивное копирование.
+pub fn move_downloaded_mods(src_dir: &std::path::Path, dst_dir: &std::path::Path) {
+    if !src_dir.is_dir() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dst_dir) {
+        tracing::error!("Cannot create destination dir {:?}: {}", dst_dir, e);
+        return;
+    }
+
+    let entries = match std::fs::read_dir(src_dir) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::error!("Cannot read {:?}: {}", src_dir, e);
+            return;
+        }
+    };
+
+    let mut moved = 0usize;
+    let mut failed = 0usize;
+
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if !src.is_dir() {
+            continue;
+        }
+        let Some(name) = src.file_name() else { continue };
+        let dst = dst_dir.join(name);
+
+        // Если в назначении уже есть папка с таким именем — удаляем,
+        // чтобы получить «свежую» версию мода.
+        if dst.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dst) {
+                tracing::error!("Cannot replace existing {:?}: {}", dst, e);
+                failed += 1;
+                continue;
+            }
+        }
+
+        match std::fs::rename(&src, &dst) {
+            Ok(_) => {
+                moved += 1;
+                tracing::info!("Moved mod {:?} → {:?}", src, dst);
+            }
+            Err(_) => {
+                // Возможно, src и dst на разных файловых системах —
+                // делаем копирование + удаление.
+                if let Err(e) = copy_dir_recursive(&src, &dst) {
+                    tracing::error!("Failed to copy mod {:?} → {:?}: {}", src, dst, e);
+                    failed += 1;
+                    continue;
+                }
+                if let Err(e) = std::fs::remove_dir_all(&src) {
+                    tracing::warn!("Copied but failed to remove source {:?}: {}", src, e);
+                }
+                moved += 1;
+                tracing::info!("Copied mod {:?} → {:?}", src, dst);
+            }
+        }
+    }
+
+    tracing::info!("Moved {} mod(s) to {:?}, {} failed", moved, dst_dir, failed);
+}
+
+/// Рекурсивно копирует директорию `src` в `dst`.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_symlink() {
+            // Просто пропускаем симлинки: моды Workshop их обычно не содержат.
+            continue;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn apply_theme(ctx: &egui::Context) {

@@ -1,11 +1,10 @@
-use egui::{Button, RichText, Ui, Vec2};
+use egui::{Button, RichText, Ui};
 use crate::mod_data::ModEntry;
 use crate::app::theme;
 
 /// Результат взаимодействия с панелью инструментов.
 #[derive(Default)]
 pub struct ToolbarResponse {
-    pub open_clicked: bool,
     pub save_clicked: bool,
     pub sort_clicked: bool,
     pub settings_clicked: bool,
@@ -18,13 +17,13 @@ pub struct ToolbarResponse {
 }
 
 /// Отрисовывает панель инструментов и возвращает информацию о нажатых кнопках.
-pub fn show_toolbar(ui: &mut Ui, mods: &[ModEntry]) -> ToolbarResponse {
+pub fn show_toolbar(ui: &mut Ui, _mods: &[ModEntry]) -> ToolbarResponse {
     let mut resp = ToolbarResponse::default();
 
     ui.horizontal(|ui| {
         // Логотип / заголовок
         ui.label(
-            RichText::new("◈ RUSTRIM")
+            RichText::new("RUSTRIM")
                 .color(theme::TEXT_ACCENT)
                 .size(13.0)
                 .strong(),
@@ -35,15 +34,6 @@ pub fn show_toolbar(ui: &mut Ui, mods: &[ModEntry]) -> ToolbarResponse {
         ui.add_space(4.0);
 
         // Файловые операции
-        let open_btn = Button::new(
-            RichText::new("📂 Открыть").color(theme::TEXT_PRIMARY).size(12.0),
-        )
-        .fill(theme::BG_ROW_EVEN)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER));
-
-        if ui.add(open_btn).on_hover_text("Открыть папку с модами").clicked() {
-            resp.open_clicked = true;
-        }
 
         let save_btn = Button::new(
             RichText::new("💾 Сохранить").color(theme::TEXT_PRIMARY).size(12.0),
@@ -179,7 +169,7 @@ pub fn show_toolbar(ui: &mut Ui, mods: &[ModEntry]) -> ToolbarResponse {
             // Легенда
             ui.label(RichText::new("◉ Local").color(theme::SOURCE_LOCAL).size(10.5));
             ui.add_space(4.0);
-            ui.label(RichText::new("⬡ Workshop").color(theme::SOURCE_WORKSHOP).size(10.5));
+            ui.label(RichText::new("◇ Workshop").color(theme::SOURCE_WORKSHOP).size(10.5));
             ui.add_space(4.0);
             ui.label(RichText::new("★ DLC").color(theme::SOURCE_DLC).size(10.5));
             ui.add_space(4.0);
