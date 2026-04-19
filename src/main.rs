@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let icon = eframe::icon_data::from_png_bytes(
-        include_bytes!("../assets/icon.png")
+        include_bytes!("assets/icon.png")
     ).ok();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
             let mut fonts = egui::FontDefinitions::default();
-            let font_bytes = include_bytes!("../assets/NotoSansSC.ttf").to_vec();
+            let font_bytes = include_bytes!("assets/NotoSansSC.ttf").to_vec();
             fonts.font_data.insert(
                 "NotoSansSC".to_owned(),
                 egui::FontData::from_owned(font_bytes).into(),

@@ -1,5 +1,5 @@
 ##############################################################################
-# Void Canvas — Makefile
+# RustRim — Makefile
 # Использование (внутри nix-shell):
 #   make linux      — нативный Linux бинарник
 #   make appimage   — AppImage для Linux
@@ -9,9 +9,9 @@
 ##############################################################################
 
 # Имя бинарника (cargo: дефисы → подчёркивания)
-CARGO_BIN  := void_canvas
+CARGO_BIN  := rust-rim
 # Имя артефактов в dist/
-APP_NAME   := void-canvas
+APP_NAME   := rust-rim
 APP_VER    := $(shell grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
 DIST       := dist
 
@@ -83,7 +83,7 @@ _appdir: $(BIN_LIN)
 	    AppDir/$(APP_NAME).png
 
 	# .desktop
-	printf '[Desktop Entry]\nType=Application\nName=Void Canvas\nExec=void-canvas\nIcon=void-canvas\nCategories=Graphics;\nComment=ASCII art editor\n' \
+	printf '[Desktop Entry]\nType=Application\nName=RustRim\nExec=rust-rim\nIcon=rust-rim\nCategories=Game\nComment=RimWorld mod manager\n' \
 	    > AppDir/$(APP_NAME).desktop
 
 	# AppRun — враппер, прописывает LD_LIBRARY_PATH внутри AppImage
