@@ -1,4 +1,4 @@
-use egui::{Color32, Frame, Margin, RichText, Stroke};
+use egui::{Color32, Frame, Margin, RichText, ScrollArea, Stroke};
 use std::sync::mpsc;
 
 use crate::app::theme;
@@ -285,14 +285,19 @@ impl SteamCmdPanel {
         ui.add_space(4.0);
 
         let edit_enabled = installed && !is_busy;
-        ui.add_enabled(
-            edit_enabled,
-            egui::TextEdit::multiline(&mut self.ids_input)
-                .desired_width(f32::INFINITY)
-                .desired_rows(4)
-                .font(egui::TextStyle::Monospace)
-                .hint_text("2009463077\n1507748539\n…"),
-        );
+        ScrollArea::vertical()
+            .max_height(120.0)               // ← лимит высоты в пикселях (подберите под свой UI)
+            .id_salt("workshop_ids_scroll")  // ← уникальный ID для сохранения позиции (опционально)
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    edit_enabled,
+                    egui::TextEdit::multiline(&mut self.ids_input)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)     // всё ещё желаемая высота, но ScrollArea её обрежет
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("2009463077\n1507748539\n…"),
+                );
+            });
 
         ui.add_space(6.0);
         ui.checkbox(

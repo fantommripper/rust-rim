@@ -798,6 +798,7 @@ impl WorkshopBrowser {
                         egui::ScrollArea::horizontal()
                             .id_salt("wsbrowser_coll_queue_tags")
                             .max_height(26.0)
+                            .max_width(ui.available_width() * 0.7)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let snap = self.queue.clone();
