@@ -2,7 +2,7 @@
 
 A RimWorld mod manager written in Rust, built with [egui](https://github.com/emilk/egui).
 
-![screenshot placeholder](assets/icon.png)
+![screenshot placeholder](src/assets/icon.png)
 
 ## Features
 
