@@ -60,6 +60,14 @@ pub struct AppSettings {
     /// Базовая папка для SteamCMD (steamcmd/ и steam/ создаются внутри).
     /// Пустая строка → используется папка данных приложения.
     pub steamcmd_path: String,
+    /// Автоматически перемещать скачанные моды в папку локальных модов после загрузки.
+    pub steamcmd_auto_move: bool,
+    /// Включить параллельную загрузку модов несколькими процессами SteamCMD.
+    pub steamcmd_multi_download: bool,
+    /// Максимальное количество параллельных процессов SteamCMD (2–4 рекомендуется).
+    pub steamcmd_max_processes: usize,
+    /// Минимальное число модов для активации мульти-загрузки.
+    pub steamcmd_multi_threshold: usize,
     #[serde(skip)]
     pub active_tab: SettingsTab,
 }
@@ -75,6 +83,10 @@ impl Default for AppSettings {
             sort_on_load: false,
             use_community_rules: true,
             steamcmd_path: String::new(),
+            steamcmd_auto_move: true,
+            steamcmd_multi_download: true,
+            steamcmd_max_processes: 2,
+            steamcmd_multi_threshold: 10,
             active_tab: SettingsTab::default(),
         }
     }
@@ -504,7 +516,15 @@ impl eframe::App for RustRim {
         // ── Панель SteamCMD ──────────────────────────────────────────────────
         if self.show_steamcmd_panel {
             let base = self.settings.effective_steamcmd_path();
-            if self.steamcmd_panel.show(&ctx, &mut self.show_steamcmd_panel, &base) {
+            if self.steamcmd_panel.show(
+                &ctx,
+                &mut self.show_steamcmd_panel,
+                &base,
+                self.settings.steamcmd_auto_move,
+                self.settings.steamcmd_multi_download,
+                self.settings.steamcmd_max_processes,
+                self.settings.steamcmd_multi_threshold,
+            ) {
                 // Переносим скачанные моды в RimWorld/Mods,
                 // чтобы они лежали как обычные локальные моды.
                 let sc_base = std::path::Path::new(&base);

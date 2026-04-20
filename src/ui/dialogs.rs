@@ -305,6 +305,71 @@ pub fn settings_dialog(ctx: &Context, open: &mut bool, settings: &mut AppSetting
                              Отключите при отсутствии интернета или для оффлайн-режима."
                         ).color(theme::TEXT_MUTED).size(10.5).italics());
                     });
+
+                    ui.add_space(12.0);
+                    section_header(ui, "ЗАГРУЗКА МОДОВ (STEAMCMD)");
+                    ui.add_space(4.0);
+
+                    checkbox_row(ui, &mut settings.steamcmd_auto_move,
+                        "Автоматически перемещать моды в папку локальных модов после загрузки");
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(
+                            "Моды сразу попадают в RimWorld/Mods без ручного нажатия кнопки.\n\
+                             Отключите, если хотите проверить что скачалось перед добавлением."
+                        ).color(theme::TEXT_MUTED).size(10.5).italics());
+                    });
+
+                    ui.add_space(8.0);
+                    checkbox_row(ui, &mut settings.steamcmd_multi_download,
+                        "Параллельная загрузка (несколько процессов SteamCMD)");
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(
+                            "Запускает несколько процессов SteamCMD одновременно для ускорения загрузки.\n\
+                             Активируется только когда число модов ≥ порогу."
+                        ).color(theme::TEXT_MUTED).size(10.5).italics());
+                    });
+                    ui.add_space(8.0);
+
+                    let enabled = settings.steamcmd_multi_download;
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Макс. параллельных процессов:")
+                                .color(theme::TEXT_PRIMARY).size(12.0));
+                            ui.add_space(6.0);
+                            ui.add(egui::Slider::new(&mut settings.steamcmd_max_processes, 2..=4)
+                                .text(""));
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(
+                                "2 — стабильно для большинства систем; 3–4 только при быстром интернете."
+                            ).color(theme::TEXT_MUTED).size(10.5).italics());
+                        });
+
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Порог активации (кол-во модов):")
+                                .color(theme::TEXT_PRIMARY).size(12.0));
+                            ui.add_space(6.0);
+                            ui.add(egui::Slider::new(&mut settings.steamcmd_multi_threshold, 2..=50)
+                                .text(""));
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(
+                                "При меньшем числе модов используется один процесс (накладные расходы не оправданы)."
+                            ).color(theme::TEXT_MUTED).size(10.5).italics());
+                        });
+                    });
                 }
             }
 

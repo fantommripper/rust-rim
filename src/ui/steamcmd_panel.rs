@@ -22,6 +22,8 @@ enum State {
     Done {
         completed: usize,
         failed: Vec<u64>,
+        /// true если авто-перенос уже был инициирован (чтобы не срабатывало дважды)
+        rescan_triggered: bool,
     },
 }
 
@@ -61,6 +63,10 @@ impl SteamCmdPanel {
         ctx: &egui::Context,
         open: &mut bool,
         steamcmd_base: &str,
+        auto_move: bool,
+        multi_enabled: bool,
+        max_processes: usize,
+        multi_threshold: usize,
     ) -> bool {
         self.poll(ctx, steamcmd_base);
 
@@ -79,7 +85,7 @@ impl SteamCmdPanel {
                     .stroke(Stroke::new(1.0, theme::BORDER_ACCENT)),
             )
             .show(ctx, |ui| {
-                rescan = self.content(ui, steamcmd_base);
+                rescan = self.content(ui, steamcmd_base, auto_move, multi_enabled, max_processes, multi_threshold);
             });
 
         if was_open && !*open {
@@ -145,7 +151,7 @@ impl SteamCmdPanel {
                                 )
                             };
                             pending_logs.push(msg);
-                            next_state = Some(State::Done { completed: c, failed: fv });
+                            next_state = Some(State::Done { completed: c, failed: fv, rescan_triggered: false });
                             break;
                         }
                     }
@@ -179,7 +185,7 @@ impl SteamCmdPanel {
 
     // ── Содержимое окна ───────────────────────────────────────────────────────
 
-    fn content(&mut self, ui: &mut egui::Ui, steamcmd_base: &str) -> bool {
+    fn content(&mut self, ui: &mut egui::Ui, steamcmd_base: &str, auto_move: bool, multi_enabled: bool, max_processes: usize, multi_threshold: usize) -> bool {
         let base = std::path::Path::new(steamcmd_base);
         let nixos = steamcmd::is_nixos();
         let installed = if nixos {
@@ -322,8 +328,20 @@ impl SteamCmdPanel {
             if ui.add_enabled(can_download, dl_btn).clicked() {
                 let (tx, rx) = mpsc::channel();
                 let total = ids.len();
-                steamcmd::download_mods_async(base.to_path_buf(), ids, self.validate, tx);
+                let use_multi = multi_enabled && max_processes > 1 && total >= multi_threshold;
+                if use_multi {
+                    let procs = max_processes.min(total);
+                    steamcmd::download_mods_multi_async(base.to_path_buf(), ids, self.validate, procs, tx);
+                } else {
+                    steamcmd::download_mods_async(base.to_path_buf(), ids, self.validate, tx);
+                }
                 self.log.clear();
+                if use_multi {
+                    self.push_log(format!(
+                        "Мульти-загрузка: {} параллельных процессов для {} мод(ов)",
+                        max_processes.min(total), total
+                    ));
+                }
                 self.state = State::Downloading {
                     total,
                     completed: 0,
@@ -344,7 +362,7 @@ impl SteamCmdPanel {
             }
 
             // Итог после завершения
-            if let State::Done { completed, failed } = &self.state {
+            if let State::Done { completed, failed, .. } = &self.state {
                 ui.add_space(8.0);
                 let (text, color) = if failed.is_empty() {
                     (format!("✓ Скачано: {completed}"), theme::ACTIVE_GREEN)
@@ -361,26 +379,44 @@ impl SteamCmdPanel {
             }
         });
 
-        // Кнопка «Добавить в список» — появляется после успешной загрузки
-        if let State::Done { completed, .. } = &self.state {
-            if *completed > 0 {
-                ui.add_space(4.0);
-                let add_btn = egui::Button::new(
-                    RichText::new("↺  Перенести в Mods и обновить список")
-                        .color(theme::TEXT_PRIMARY)
-                        .size(11.0),
-                )
-                .fill(theme::BG_ROW_EVEN)
-                .stroke(Stroke::new(1.0, theme::BORDER_ACCENT));
+        // Авто-перенос: при включённой настройке срабатывает сразу после завершения
+        let trigger_auto = if let State::Done { completed, rescan_triggered, .. } = &mut self.state {
+            if *completed > 0 && auto_move && !*rescan_triggered {
+                *rescan_triggered = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if trigger_auto {
+            self.push_log("→ Перемещаем моды в папку локальных модов…".into());
+            rescan = true;
+        }
 
-                if ui
-                    .add(add_btn)
-                    .on_hover_text("Переместить скачанные моды в папку RimWorld/Mods и пересканировать список")
-                    .clicked()
-                {
-                    rescan = true;
-                    self.ids_input.clear();
-                    self.state = State::Idle;
+        // Ручная кнопка — только когда авто-перенос выключен
+        if !auto_move {
+            if let State::Done { completed, .. } = &self.state {
+                if *completed > 0 {
+                    ui.add_space(4.0);
+                    let add_btn = egui::Button::new(
+                        RichText::new("↺  Перенести в Mods и обновить список")
+                            .color(theme::TEXT_PRIMARY)
+                            .size(11.0),
+                    )
+                    .fill(theme::BG_ROW_EVEN)
+                    .stroke(Stroke::new(1.0, theme::BORDER_ACCENT));
+
+                    if ui
+                        .add(add_btn)
+                        .on_hover_text("Переместить скачанные моды в папку RimWorld/Mods и пересканировать список")
+                        .clicked()
+                    {
+                        rescan = true;
+                        self.ids_input.clear();
+                        self.state = State::Idle;
+                    }
                 }
             }
         }

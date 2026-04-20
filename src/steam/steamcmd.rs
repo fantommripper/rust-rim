@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -154,7 +154,158 @@ fn set_executable(path: &Path) {
     }
 }
 
+// ─── Чтение вывода процесса ───────────────────────────────────────────────────
+
+/// SteamCMD пишет прогресс через `\r` без `\n`. Стандартный `BufReader::lines()`
+/// ждёт `\n` и не отдаёт данные — pipe-буфер переполняется, процесс виснет.
+/// Эта функция читает поток и разбивает по обоим разделителям (`\n` и `\r`).
+fn drain_output<R: std::io::Read>(reader: &mut std::io::BufReader<R>, mut on_line: impl FnMut(String)) {
+    use std::io::BufRead;
+    let mut pending: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let n = {
+            let buf = match reader.fill_buf() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            if buf.is_empty() {
+                break; // EOF
+            }
+            let n = buf.len();
+            for &byte in buf {
+                if byte == b'\n' || byte == b'\r' {
+                    if !pending.is_empty() {
+                        on_line(String::from_utf8_lossy(&pending).into_owned());
+                        pending.clear();
+                    }
+                } else {
+                    pending.push(byte);
+                }
+            }
+            n
+        };
+        reader.consume(n);
+    }
+    // Последняя строка без завершающего разделителя
+    if !pending.is_empty() {
+        on_line(String::from_utf8_lossy(&pending).into_owned());
+    }
+}
+
 // ─── Скачивание модов ─────────────────────────────────────────────────────────
+
+/// Разбивает список ID на `n` примерно равных частей.
+fn split_chunks(ids: Vec<u64>, n: usize) -> Vec<Vec<u64>> {
+    let mut chunks: Vec<Vec<u64>> = (0..n).map(|_| Vec::new()).collect();
+    for (i, id) in ids.into_iter().enumerate() {
+        chunks[i % n].push(id);
+    }
+    chunks.into_iter().filter(|c| !c.is_empty()).collect()
+}
+
+/// Запускает несколько параллельных процессов SteamCMD.
+/// Каждый воркер получает изолированную папку `steam_worker_{i}` во избежание
+/// конфликтов lock-файлов SteamCMD. После завершения агрегатор переносит
+/// скачанный контент в канонический путь `{base}/steam/`.
+/// Итоговый `Finished` отправляется только когда завершатся все процессы.
+pub fn download_mods_multi_async(
+    base: PathBuf,
+    ids: Vec<u64>,
+    validate: bool,
+    max_processes: usize,
+    tx: mpsc::Sender<DownloadEvent>,
+) {
+    let n = max_processes.clamp(1, ids.len());
+    let chunks = split_chunks(ids, n);
+    let worker_count = chunks.len();
+
+    // Папки воркеров — изолированы, чтобы SteamCMD не конфликтовали по lock-файлам
+    let worker_bases: Vec<PathBuf> = (0..worker_count)
+        .map(|i| base.join(format!("steam_worker_{i}")))
+        .collect();
+
+    let (inner_tx, inner_rx) = mpsc::channel::<DownloadEvent>();
+
+    for (chunk, worker_base) in chunks.into_iter().zip(worker_bases.iter().cloned()) {
+        let worker_tx = inner_tx.clone();
+        let base_clone = base.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = run_download(&worker_base, &chunk, validate, &worker_tx) {
+                let _ = worker_tx.send(DownloadEvent::Log(format!("Критическая ошибка: {e}")));
+                let _ = worker_tx.send(DownloadEvent::Finished { failed: chunk });
+                return;
+            }
+            // Переносим скачанный контент в канонический путь {base}/steam/
+            let src = steam_content_path(&worker_base);
+            let dst = steam_content_path(&base_clone);
+            if src.is_dir() {
+                if let Err(e) = move_dir_contents(&src, &dst) {
+                    let _ = worker_tx.send(DownloadEvent::Log(
+                        format!("⚠ Не удалось переместить контент воркера: {e}")
+                    ));
+                }
+                let _ = std::fs::remove_dir_all(worker_base);
+            }
+        });
+    }
+    drop(inner_tx); // канал закроется когда все воркеры завершатся
+
+    std::thread::spawn(move || {
+        let mut finished = 0;
+        let mut all_failed: Vec<u64> = Vec::new();
+        for ev in inner_rx {
+            match ev {
+                DownloadEvent::Finished { failed } => {
+                    finished += 1;
+                    all_failed.extend(failed);
+                    if finished == worker_count {
+                        let _ = tx.send(DownloadEvent::Finished { failed: all_failed });
+                        return;
+                    }
+                    // Промежуточные Finished не пересылаем — только финальный
+                }
+                other => {
+                    let _ = tx.send(other);
+                }
+            }
+        }
+        // Канал закрылся раньше времени — всё равно отправляем Finished
+        if finished < worker_count {
+            let _ = tx.send(DownloadEvent::Finished { failed: all_failed });
+        }
+    });
+}
+
+/// Перемещает содержимое папки `src` в `dst` (рекурсивно по модам верхнего уровня).
+fn move_dir_contents(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if !target.exists() {
+            std::fs::rename(entry.path(), &target).or_else(|_| {
+                // rename не работает между разными точками монтирования — копируем и удаляем
+                copy_dir_all(&entry.path(), &target)
+                    .and_then(|_| std::fs::remove_dir_all(entry.path()).map_err(Into::into))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
 
 pub fn download_mods_async(
     base: PathBuf,
@@ -233,41 +384,35 @@ fn run_download(
         .spawn()
         .map_err(|e| anyhow::anyhow!("Не удалось запустить SteamCMD: {e}"))?;
 
-    // Отдельный поток для чтения stderr (предотвращает deadlock)
+    // Отдельный поток для чтения stderr (предотвращает deadlock).
+    // Используем drain_output вместо lines() — SteamCMD может выводить \r без \n.
     let tx_err = tx.clone();
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            let mut reader = std::io::BufReader::new(stderr);
+            drain_output(&mut reader, |line| {
                 for part in split_ansi_lines(&line) {
                     if !part.is_empty() {
                         let _ = tx_err.send(DownloadEvent::Log(part));
                     }
                 }
-            }
+            });
         });
     }
 
     // ── Чтение stdout и разбор прогресса ────────────────────────────────────
+    // drain_output разбивает по \n И \r, исключая pipe-deadlock от \r-прогресса SteamCMD.
     let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("stdout не настроен"))?;
-    let reader = std::io::BufReader::new(stdout);
+    let mut reader = std::io::BufReader::new(stdout);
 
     let mut failed: Vec<u64> = Vec::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        // SteamCMD иногда объединяет несколько событий в одну строку через ANSI-коды.
-        // Разбиваем по ANSI-границам и \r, проверяем все паттерны независимо.
-        for part in split_ansi_lines(&line) {
-            if part.is_empty() { continue; }
-
+    drain_output(&mut reader, |raw_line| {
+        // SteamCMD иногда объединяет несколько событий через ANSI-коды — разбиваем дополнительно.
+        for part in split_ansi_lines(&raw_line) {
             let _ = tx.send(DownloadEvent::Log(part.clone()));
 
-            // Не используем else-if: одна часть строки может содержать и Success, и Downloading
+            // Не используем else-if: одна часть может содержать и Success, и Downloading
             if let Some(id) = parse_downloading_id(&part) {
                 let _ = tx.send(DownloadEvent::ItemStarted(id));
             }
@@ -281,7 +426,7 @@ fn run_download(
                 let _ = tx.send(DownloadEvent::ItemFailed(id));
             }
         }
-    }
+    });
 
     let status = child.wait()?;
 
