@@ -1,105 +1,135 @@
 # rust-rim
 
-A RimWorld mod manager written in Rust, built with [egui](https://github.com/emilk/egui).
+> **Менеджер модов для RimWorld**, написанный на Rust с использованием [egui](https://github.com/emilk/egui).
 
-![screenshot placeholder](src/assets/icon.png)
+![скриншот](src/assets/icon.png)
 
-## Features
+---
 
-- **Dual-pane mod list** — inactive mods on the left, active load order on the right
-- **Drag & drop reordering** — grab any mod and drop it into position
-- **Search & filter** — live filtering in both panes simultaneously
-- **Mod details panel** — shows description, version, author, supported versions and a preview image
-- **Dependency & conflict warnings** — highlights missing dependencies (⚠) and active incompatibilities (✕)
-- **Smart sort** — topological sort using `loadBefore`/`loadAfter` metadata with priority tiers (pre-Core patches → Core → DLC → frameworks → regular mods), optionally augmented by the [RimSort community rules database](https://github.com/RimSort/Community-Rules-Database)
-- **Steam Workshop browser** — browse and search Workshop items by trending / latest / most subscribed / recently updated; browse and install collections
-- **SteamCMD integration** — download Workshop mods directly without Steam; NixOS-aware (uses system `steamcmd` via `steam-run`)
-- **Duplicate detection** — finds mods installed in multiple locations and lets you remove the extras
-- **Persistent settings** — game path, config path, local mods path and SteamCMD location saved per user
+## ⚡ Почему rust-rim?
 
-## Building
+rust-rim написан на **Rust** — системном языке с нативной компиляцией и нулевым рантаймом.
+В отличие от популярных аналогов [RimSort](https://github.com/RimSort/RimSort) и [RimPy](https://github.com/rimpy-custom/RimPy), написанных на **Python**, rust-rim:
 
-Requires a recent stable Rust toolchain (edition 2024).
+- **Запускается мгновенно** — нет интерпретатора, нет прогрева виртуальной машины
+- **Потребляет в разы меньше памяти** — нет Python-рантайма и тяжёлых фреймворков
+- **Работает быстрее** — сканирование, сортировка и поиск по тысячам модов за миллисекунды
+
+---
+
+## Возможности
+
+- **Двухпанельный список модов** — неактивные слева, активный порядок загрузки справа
+- **Перетаскивание** — меняй порядок модов drag & drop
+- **Поиск и фильтрация** — живая фильтрация в обеих панелях одновременно
+- **Панель информации о моде** — описание, версия, автор, поддерживаемые версии игры и превью-изображение
+- **Предупреждения о зависимостях и конфликтах** — подсвечивает отсутствующие зависимости (⚠) и активные несовместимости (✕)
+- **Умная сортировка** — топологическая сортировка по метаданным `loadBefore`/`loadAfter` с приоритетными уровнями (патчи до Core → Core → DLC → фреймворки → обычные моды), опционально дополняется [базой правил сообщества RimSort](https://github.com/RimSort/Community-Rules-Database)
+- **Браузер Steam Workshop** — просмотр и поиск по трендовым / новым / популярным / недавно обновлённым; просмотр и установка коллекций
+- **Интеграция SteamCMD** — загрузка модов с Workshop напрямую без Steam; поддержка NixOS (использует системный `steamcmd` через `steam-run`)
+- **Обнаружение дубликатов** — находит моды, установленные в нескольких местах, и позволяет удалить лишние
+- **Сохранение настроек** — пути к игре, конфигу, локальным модам и SteamCMD сохраняются на уровне пользователя
+
+---
+
+## Установка
+
+### Готовые сборки
+
+Скачай нужный файл со [страницы релизов](../../releases):
+
+| Платформа | Файл |
+|---|---|
+| Linux (бинарник) | `rust-rim-1.1.0-linux-x86_64` |
+| Linux (AppImage) | `rust-rim-1.1.0-x86_64.AppImage` |
+| Windows | `rust-rim-1.1.0-windows-x86_64.exe` |
+
+### Сборка из исходников
+
+Требуется свежий стабильный тулчейн Rust (edition 2024).
 
 ```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/rust-rim`.
+Бинарник появится по пути `target/release/rust-rim`.
 
-### NixOS
+#### NixOS
 
-A `nix-shell` environment is recommended. The app automatically detects NixOS (via `/etc/NIXOS`) and uses the system `steamcmd` wrapped in `steam-run` instead of downloading its own copy.
+Рекомендуется окружение `nix-shell`. Приложение автоматически определяет NixOS (через `/etc/NIXOS`) и использует системный `steamcmd`, обёрнутый в `steam-run`.
 
-### Dependencies (Linux)
+#### Зависимости (Linux)
 
-egui uses `winit` + `wgpu` by default. You need standard graphics and windowing libraries:
+egui использует `winit` + `wgpu`. Нужны стандартные графические библиотеки:
 
 - X11: `libx11`, `libxcb`, `libxi`, `libxkbcommon`
 - Wayland: `wayland`, `libxkbcommon`
-- GPU: Vulkan or OpenGL drivers
+- GPU: драйверы Vulkan или OpenGL
 
-On NixOS these are provided by the shell environment.
+На NixOS всё предоставляется окружением shell.
 
-## Usage
+---
 
-### First run
+## Использование
 
-1. Launch `rust-rim`.
-2. Open **Settings** (toolbar gear icon) and set:
-   - **Game path** — the RimWorld installation directory (e.g. `~/.steam/steam/steamapps/common/RimWorld`)
-   - **Config path** — the RimWorld config directory containing `ModsConfig.xml` (e.g. `~/.config/unity3d/Ludeon Studios/RimWorld by Ludeon Studios/Config`)
-   - **Local mods path** — optional, your custom mods folder
-3. Click **Scan** (or restart) to load mods. The active list is read from `ModsConfig.xml`.
+### Первый запуск
 
-### Managing mods
+1. Запусти `rust-rim`.
+2. Открой **Настройки** (иконка шестерёнки на панели) и укажи:
+   - **Путь к игре** — директория установки RimWorld (напр. `~/.steam/steam/steamapps/common/RimWorld`)
+   - **Путь к конфигу** — директория конфига RimWorld с файлом `ModsConfig.xml` (напр. `~/.config/unity3d/Ludeon Studios/RimWorld by Ludeon Studios/Config`)
+   - **Путь к локальным модам** — твоя папка с локальными модами (напр. `~/.steam/steam/steamapps/common/RimWorld/Mods`)
 
-| Action | How |
+### Управление модами
+
+| Действие | Как |
 |---|---|
-| Activate / deactivate | Double-click a mod, or right-click → menu |
-| Reorder | Drag & drop within the active list |
-| Move one step | Right-click → Move up / Move down |
-| Open mod folder | Right-click → Open folder |
-| Filter | Type in the search box above either list |
+| Активировать / деактивировать | Двойной клик по моду или ПКМ → меню |
+| Изменить порядок | Drag & drop в активном списке |
+| Переместить на шаг | ПКМ → Вверх / Вниз |
+| Открыть папку мода | ПКМ → Открыть папку |
+| Фильтрация | Введи текст в поиск над любым списком |
 
-### Sorting
+### Сортировка
 
-Click **Sort** in the toolbar to auto-sort the active list. The sorter:
+Нажми **Сортировать** на панели инструментов для авто-сортировки активного списка. Алгоритм:
 
-1. Puts pre-Core patches (Harmony, Prepatcher, etc.) first
-2. Follows with Core and DLC in release order
-3. Places framework mods (HugsLib, VFE Core, etc.) next
-4. Resolves `loadBefore`/`loadAfter` constraints from mod metadata via Kahn's algorithm
-5. Optionally applies community rules fetched from the RimSort database (toggle in Settings → Behavior)
+1. Ставит патчи до Core первыми (Harmony, Prepatcher и т.д.)
+2. Затем Core и DLC в порядке выхода
+3. Размещает фреймворки (HugsLib, VFE Core и т.д.)
+4. Разрешает зависимости `loadBefore`/`loadAfter` алгоритмом Кана
+5. Опционально применяет правила сообщества из базы RimSort (переключается в Настройки → Поведение)
 
 ### Steam Workshop
 
-Click the **Workshop** button to open the browser. You can:
-- Search or browse by sort order
-- Switch between **Mods** and **Collections** tabs
-- Click a collection to expand and queue all its items for download
-- Download queued items via **SteamCMD** (installs automatically on first use, or uses system `steamcmd` on NixOS)
+Нажми кнопку **Workshop** для открытия браузера. Доступно:
+- Поиск и просмотр по порядку сортировки
+- Переключение между вкладками **Моды** и **Коллекции**
+- Клик по коллекции — раскрывает и добавляет все её элементы в очередь загрузки
+- Загрузка через **SteamCMD** (устанавливается автоматически при первом использовании, или используется системный `steamcmd` на NixOS)
 
-Downloaded mods land in `{steamcmd_path}/steam/steamapps/workshop/content/294100/` and are automatically picked up on next scan.
+---
 
-## Configuration
+## Конфигурация
 
-Settings are stored in the OS config directory:
+Настройки хранятся в системной директории конфигов:
 
-| Platform | Path |
+| Платформа | Путь |
 |---|---|
-| Linux | `~/.config/rustrim/RustRim/settings.json` |
+| Linux | `~/.config/rustrim/settings.json` |
 | macOS | `~/Library/Application Support/com.rustrim.RustRim/settings.json` |
-| Windows | `%APPDATA%\rustrim\RustRim\config\settings.json` |
+| Windows | `%APPDATA%\rustrim\config\settings.json` |
 
-SteamCMD data defaults to the OS data directory (`~/.local/share/rustrim/RustRim/steamcmd_data` on Linux) unless overridden in Settings.
+Данные SteamCMD по умолчанию в директории данных ОС (`~/.local/share/rustrim/steamcmd_data` на Linux), если не переопределено в Настройках.
 
-Logging is controlled via the `RUST_LOG` environment variable (default: `warn`):
+Логирование управляется переменной окружения `RUST_LOG` (по умолчанию: `warn`):
 
 ```bash
 RUST_LOG=info cargo run
 ```
 
-## License
+---
+
+## Лицензия
 
 Modified MIT
